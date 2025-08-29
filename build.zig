@@ -32,6 +32,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const memtable_mod = b.createModule(.{
+        .root_source_file = b.path("src/memtable.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Add dependency: main.zig depends on model.zig
     exe_mod.addImport("model", model_mod);
 
@@ -88,4 +94,11 @@ pub fn build(b: *std.Build) void {
     });
     const run_model_unit_tests = b.addRunArtifact(model_unit_tests);
     test_step.dependOn(&run_model_unit_tests.step);
+
+    // Test step for memtable.zig
+    const memtable_unit_tests = b.addTest(.{
+        .root_module = memtable_mod,
+    });
+    const run_memtable_unit_tests = b.addRunArtifact(memtable_unit_tests);
+    test_step.dependOn(&run_memtable_unit_tests.step);
 }

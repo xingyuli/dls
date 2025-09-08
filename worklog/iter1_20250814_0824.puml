@@ -1,0 +1,17 @@
+@startuml iter1
+
+class LogEntry {
+    timestamp : u64
+    message : []const u8
+    metadata : ?std.json.Parsed<std.json.Value>
+    version : u8
+
+    + ser(self: *const LogEntry, allocator: Allocator) ![]u8
+    + deser(allocator: Allocator, serialized: []const u8) !LogEntry
+}
+
+note right of LogEntry::timestamp
+  milli ts
+end note
+
+@enduml

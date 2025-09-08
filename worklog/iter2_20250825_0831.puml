@@ -1,0 +1,26 @@
+@startuml iter2
+
+class LogEntry {
+    timestamp : u64
+    message : []const u8
+    metadata : ?std.json.Parsed<std.json.Value>
+    version : u8
+
+    + ser(self: *const LogEntry, allocator: Allocator) ![]u8
+    + deser(allocator: Allocator, serialized: []const u8) !LogEntry
+}
+
+note right of LogEntry::timestamp
+  milli ts
+end note
+
+class MemTable {
+  {field} entries : std.ArrayList(LogEntry)
+
+  + writeLog(self: *MemTable, entry: LogEntry) !void
+  + readLog(self: *const MemTable, start_ts: u64, end_ts: u64) ![]const LogEntry
+}
+
+MemTable *- LogEntry
+
+@enduml

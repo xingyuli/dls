@@ -1,0 +1,48 @@
+@startuml iter3
+
+class LogEntry {
+    timestamp : u64
+    message : []const u8
+    metadata : ?std.json.Parsed<std.json.Value>
+    version : u8
+
+    + ser(self: *const LogEntry, a: Allocator) ![]u8
+    + deser(a: Allocator, serialized: []const u8) !LogEntry
+}
+
+note right of LogEntry::timestamp
+  milli ts
+end note
+
+class MemTable {
+  {field} entries : std.ArrayList(LogEntry)
+  wal: Wal
+  config: Config
+
+  + writeLog(self: *MemTable, entry: LogEntry) !void
+  + readLog(self: *const MemTable, start_ts: u64, end_ts: u64) ![]const LogEntry
+  - recover(self: *MemTable, a: Allocator, wal_filename: []const u8) !void
+  - writeLogRecover(self: *MemTable, entry: LogEntry) !void
+}
+
+class Config {
+    max_log_entry_write_size: u32
+    max_log_entry_recover_size: u32
+}
+
+class Wal {
+    f: std.fs.File
+
+    + append(self: *Wal, a: Allocator, entry: *const LogEntry) !void
+}
+
+note right of Wal
+    crc32 | LogEntry:deser | \n
+    other lines ...
+end note
+
+MemTable *- LogEntry
+MemTable --> Config
+MemTable --> Wal
+
+@enduml

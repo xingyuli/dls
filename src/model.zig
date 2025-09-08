@@ -64,6 +64,7 @@ pub const LogEntry = struct {
         }
     }
 
+    /// Call ownes the returned memory.
     pub fn ser(self: *const LogEntry, allocator: Allocator) ![]u8 {
         var out = std.ArrayList(u8).init(allocator);
         defer out.deinit();

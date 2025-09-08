@@ -40,3 +40,21 @@
 - Write:read ratio (~500:1) indicates writes are slower due to `LogEntry.init` allocations (message, metadata JSON parsing). Consider batching or optimizing allocations in Week 4.
 
 **Completed at**: 2025.08.27
+
+
+# Week 3: Implement WAL for Durability
+
+**Goals**: Add persistence with a Write-Ahead Log (WAL).
+
+**Tasks**:
+
+- ~~Create WAL module: Append-only file using `std.fs.File` and `write` for log entries – 3 hours.~~
+- ~~Integrate WAL into `write_log`: Serialize and append entry to WAL before in-memory update, with `fsync` for durability – 3 hours.~~
+- ~~Basic recovery: On startup, replay WAL to rebuild ArrayList – 2 hours.~~
+- ~~Tests: Simulate crashes (e.g., kill process) and verify recovery – 2 hours.~~
+
+**Deliverables**: Persistent writes via WAL with recovery mechanism.
+
+**Dependencies/Notes**: From Data Storage section. Handle file paths carefully; use `std.fs.cwd()` for simplicity.
+
+**Completed at**: 2025.09.07

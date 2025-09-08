@@ -16,7 +16,7 @@ pub const LogEntry = struct {
 
     message: []const u8,
 
-    // TODO store source ts in metadata
+    // TODO future: store source ts in metadata
     metadata: ?std.json.Parsed(std.json.Value),
 
     // client code or agent should stick with 1

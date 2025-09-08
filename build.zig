@@ -38,6 +38,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const wal_mod = b.createModule(.{
+        .root_source_file = b.path("src/wal.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Add dependency: main.zig depends on model.zig
     exe_mod.addImport("model", model_mod);
 
@@ -101,4 +107,11 @@ pub fn build(b: *std.Build) void {
     });
     const run_memtable_unit_tests = b.addRunArtifact(memtable_unit_tests);
     test_step.dependOn(&run_memtable_unit_tests.step);
+
+    // Test step for wal.zig
+    const wal_unit_tests = b.addTest(.{
+        .root_module = wal_mod,
+    });
+    const run_wal_unit_tests = b.addRunArtifact(wal_unit_tests);
+    test_step.dependOn(&run_wal_unit_tests.step);
 }

@@ -1,3 +1,6 @@
+// Copyright (c) 2025 Vic Lau
+// Licensed under the MIT License
+
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
@@ -102,14 +105,9 @@ pub const LogEntry = struct {
 
         const owned_message = try allocator.dupe(u8, dv.message);
 
-        // rebuild metadata: re-stringify + re-parse to own the memory
         var owned_metadata: ?std.json.Parsed(std.json.Value) = null;
         if (dv.metadata) |meta| {
-            var out = std.ArrayList(u8).init(allocator);
-            defer out.deinit();
-
-            try std.json.stringify(meta, .{}, out.writer());
-            owned_metadata = try std.json.parseFromSlice(std.json.Value, allocator, out.items, .{});
+            owned_metadata = try cloneMetadata(allocator, meta);
         }
 
         return LogEntry{
@@ -118,6 +116,31 @@ pub const LogEntry = struct {
             .metadata = owned_metadata,
             .version = dv.version,
         };
+    }
+
+    pub fn clone(self: *const LogEntry, allocator: Allocator) !LogEntry {
+        const owned_message = try allocator.dupe(u8, self.message);
+
+        var owned_metadata: ?std.json.Parsed(std.json.Value) = null;
+        if (self.metadata) |meta| {
+            owned_metadata = try cloneMetadata(allocator, meta.value);
+        }
+
+        return LogEntry{
+            .timestamp = self.timestamp,
+            .message = owned_message,
+            .metadata = owned_metadata,
+            .version = self.version,
+        };
+    }
+
+    /// rebuild metadata: re-stringify + re-parse to own the memory
+    fn cloneMetadata(allocator: Allocator, meta_value: std.json.Value) !std.json.Parsed(std.json.Value) {
+        var out = std.ArrayList(u8).init(allocator);
+        defer out.deinit();
+
+        try std.json.stringify(meta_value, .{}, out.writer());
+        return try std.json.parseFromSlice(std.json.Value, allocator, out.items, .{});
     }
 };
 
@@ -247,4 +270,34 @@ test "deserInvalidJSON" {
     const result = LogEntry.deser(testing.allocator, entry_json);
 
     try testing.expectError(error.SyntaxError, result);
+}
+
+test "cloneWithoutMetadata" {
+    const entry = try LogEntry.init(testing.allocator, "test log", null);
+    defer entry.deinit(testing.allocator);
+
+    const cloned = try entry.clone(testing.allocator);
+    defer cloned.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("test log", cloned.message);
+    try testing.expect(cloned.metadata == null);
+}
+
+test "cloneWithMetadata" {
+    const entry = try LogEntry.init(
+        testing.allocator,
+        "test log",
+        "{\"level\":\"INFO\"}",
+    );
+    defer entry.deinit(testing.allocator);
+
+    const cloned = try entry.clone(testing.allocator);
+    defer cloned.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("test log", cloned.message);
+    try testing.expect(cloned.metadata != null);
+
+    if (cloned.metadata) |meta| {
+        try testing.expectEqualStrings("INFO", meta.value.object.get("level").?.string);
+    }
 }

@@ -1,3 +1,6 @@
+// Copyright (c) 2025 Vic Lau
+// Licensed under the MIT License
+
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;

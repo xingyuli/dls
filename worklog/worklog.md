@@ -58,3 +58,19 @@
 **Dependencies/Notes**: From Data Storage section. Handle file paths carefully; use `std.fs.cwd()` for simplicity.
 
 **Completed at**: 2025.09.07
+
+
+# Week 4: LSM-Tree Memtable and Initial Flush
+
+**Goals**: Transition to LSM-Tree basics with memtable flushing.
+
+**Tasks**:
+
+- ~~Replace plain ArrayList with memtable (sorted `std.ArrayList` or `std.AutoHashMap` for timestamp keys) – 3 hours.~~
+- ~~Implement flush: When memtable reaches threshold (e.g., 100 entries), write to immutable SSTable file (simple binary format: timestamp + serialized entry) – 3 hours.~~
+- ~~Update `read_logs` to scan memtable and SSTables sequentially – 2 hours.~~
+- ~~Tests for flush and multi-file reads – 2 hours.~~
+
+**Deliverables**: Basic LSM-Tree with memtable and SSTable support.
+
+**Dependencies/Notes**: Data Storage section. Defer compaction/indexing. Use binary encoding for SSTables to minimize overhead.

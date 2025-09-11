@@ -1,3 +1,6 @@
+// Copyright (c) 2025 Vic Lau
+// Licensed under the MIT License
+
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
@@ -14,6 +17,10 @@ const Config = struct {
     /// `max_log_entry_write_size`. But in general it is suggested to keep as a fixed value for all instances of
     /// MemTable. That is to say, `max_log_entry_write_size` should be set to a value smaller than recovery size.
     max_log_entry_recover_size: u32 = 1024 * 1024 * 10,
+
+    /// Threshold for memtable flushing (number of entries). Default to 100 as a reasonable starting point to balance
+    /// memory usage and I/O overhead.
+    flush_threshold: u32 = 100,
 };
 
 pub const MemTable = struct {
@@ -23,6 +30,9 @@ pub const MemTable = struct {
     wal: Wal,
     config: Config,
 
+    // Track SSTable filenames
+    sstable_files: std.ArrayList([]u8),
+
     /// Initializes a MemTable and recovers log entries from the specified WAL file.
     /// The caller owns the returned MemTable, deinitialize with `deinit`.
     pub fn init(allocator: Allocator, wal_filename: []const u8, config: Config) !MemTable {
@@ -30,6 +40,7 @@ pub const MemTable = struct {
             .entries = std.ArrayList(LogEntry).init(allocator),
             .wal = try Wal.init(wal_filename),
             .config = config,
+            .sstable_files = std.ArrayList([]u8).init(allocator),
         };
         try recover(&self, allocator, wal_filename);
         return self;
@@ -41,11 +52,45 @@ pub const MemTable = struct {
             it.deinit(entry_allocator);
         }
         self.entries.deinit();
+
         self.wal.deinit();
+
+        for (self.sstable_files.items) |filename| {
+            self.sstable_files.allocator.free(filename);
+        }
+        self.sstable_files.deinit();
+    }
+
+    /// Finds the insertion index for a new entry to maintain sorted order by timestamp.
+    fn findInsertIndex(self: *const MemTable, timestamp: u64) usize {
+        for (self.entries.items, 0..) |entry, i| {
+            if (entry.timestamp > timestamp) {
+                return i;
+            }
+        }
+        return self.entries.items.len;
     }
 
     /// Appends a log entry to the MemTable and persists it to the WAL.
     pub fn writeLog(self: *MemTable, entry: LogEntry) !void {
+        // TODO future: handle outdated timestamp values in MemTable entries, possible solutions are:
+        //   1. discard if `current_timestamp - entry.timestamp > delay_allowed` ?
+        //   2. backfill?
+        //   3. combine discard and backfill by comparing the entry.timestamp's age and delay_allowed ?
+
+        // Or ... Adjust Timestamps with Metadata Preservation
+        //
+        // How It Works:
+        //
+        // - In writeLog, compare entry.timestamp to the current system time (std.time.nanoTimestamp()).
+        //
+        // - If the difference exceeds a configurable threshold (delay_allowed, e.g., 24 hours), set entry.timestamp to
+        // the current time and store the original timestamp in entry.metadata as client_timestamp.
+        //
+        // - Persist the adjusted entry in the WAL and memtable, ensuring SSTables are written in chronological order.
+        //
+        // - Apply the same validation in recover to handle WAL entries consistently.
+
         if (entry.message.len > self.config.max_log_entry_write_size) {
             // TODO future: report write discard via metrics
             std.log.warn(
@@ -73,14 +118,58 @@ pub const MemTable = struct {
             break;
         }
 
+        const index = self.findInsertIndex(entry.timestamp);
         // TODO future: auto recover ? maybe unnecessary as MemTable is just a cache and currently not used anywhere else
-        // Then append to MemTable
-        try self.entries.append(entry);
+
+        // Then insert to MemTable
+        try self.entries.insert(index, entry);
+
+        // Check if flush is needed
+        if (self.entries.items.len >= self.config.flush_threshold) {
+            try self.flush();
+        }
     }
 
     /// Appends a log entry to the MemTable (used during recovery).
     fn writeLogRecover(self: *MemTable, entry: LogEntry) !void {
-        try self.entries.append(entry);
+        const index = self.findInsertIndex(entry.timestamp);
+        try self.entries.insert(index, entry);
+    }
+
+    /// Flush the memtable to an SSTable file.
+    fn flush(self: *MemTable) !void {
+        if (self.entries.items.len == 0) return;
+
+        // Generate uniq SSTable filename (e.g., sst_0001.bin)
+        const filename = try std.fmt.allocPrint(
+            self.sstable_files.allocator,
+            "sst_{d:0>4}.bin",
+            .{self.sstable_files.items.len + 1},
+        );
+
+        const f = try std.fs.cwd().createFile(filename, .{});
+        defer f.close();
+
+        // Write entries in binary format: [timestamp: u64][length: u32][serialized_entry]
+        for (self.entries.items) |entry| {
+            try f.writeAll(&std.mem.toBytes(entry.timestamp));
+
+            const serialized = try entry.ser(self.entries.allocator);
+            defer self.entries.allocator.free(serialized);
+            try f.writeAll(&std.mem.toBytes(@as(u32, @intCast(serialized.len))));
+
+            try f.writeAll(serialized);
+        }
+        try f.sync();
+
+        // Track SSTable file
+        try self.sstable_files.append(filename);
+
+        // Clear memtable
+        for (self.entries.items) |*entry| {
+            entry.deinit(self.entries.allocator);
+        }
+        self.entries.clearRetainingCapacity();
     }
 
     /// The caller owns the returned slice. Reads log entries within the specified time range [start_ts, end_ts].
@@ -88,11 +177,64 @@ pub const MemTable = struct {
         var result = std.ArrayList(LogEntry).init(self.entries.allocator);
         defer result.deinit();
 
+        // Read from memtable
         for (self.entries.items) |it| {
             if (it.timestamp >= start_ts and it.timestamp <= end_ts) {
-                try result.append(it);
+                const cloned = try it.clone(self.entries.allocator);
+                try result.append(cloned);
             }
         }
+
+        // Read from SSTables
+        for (self.sstable_files.items) |filename| {
+            const f = try std.fs.cwd().openFile(filename, .{ .mode = .read_only });
+            defer f.close();
+
+            var reader = f.reader();
+
+            while (true) {
+                // Read timestamp (u64)
+                var ts_bytes: [8]u8 = undefined;
+                const ts_read = try reader.readAll(&ts_bytes);
+                if (ts_read == 0) break;
+                if (ts_read < 8) {
+                    std.log.warn("Corrupted SSTable {s}: incomplete timestamp", .{filename});
+                    break;
+                }
+                const timestamp = std.mem.readInt(u64, &ts_bytes, .little);
+
+                // Read length (u32)
+                var len_bytes: [4]u8 = undefined;
+                if (try reader.readAll(&len_bytes) < 4) {
+                    std.log.warn("Corrupted SSTable {s}: incomplete length", .{filename});
+                    break;
+                }
+                const len = std.mem.readInt(u32, &len_bytes, .little);
+
+                // Read serialized entry
+                const serialized = try self.entries.allocator.alloc(u8, len);
+                defer self.entries.allocator.free(serialized);
+                if (try reader.readAll(serialized) < len) {
+                    std.log.warn("Corrupted SSTable {s}: incomplete entry", .{filename});
+                    break;
+                }
+
+                // Skip entries outside time range
+                if (timestamp < start_ts or timestamp > end_ts) continue;
+
+                // Deserialize and add to result
+                const entry = try LogEntry.deser(self.entries.allocator, serialized);
+                try result.append(entry);
+            }
+        }
+
+        // Sort results by timestamp
+        //   thus handle cases where SSTables and memtable entries are interleaved
+        std.sort.heap(LogEntry, result.items, {}, struct {
+            fn lessThan(_: void, lhs: LogEntry, rhs: LogEntry) bool {
+                return lhs.timestamp < rhs.timestamp;
+            }
+        }.lessThan);
 
         return try result.toOwnedSlice();
     }
@@ -172,7 +314,12 @@ test "writeAndReadLog" {
     try testing.expectEqual(@as(usize, 2), t.entries.items.len);
 
     const logs = try t.readLog(0, std.math.maxInt(u64));
-    defer a.free(logs);
+    defer {
+        for (logs) |*entry| {
+            entry.deinit(a);
+        }
+        a.free(logs);
+    }
 
     try testing.expectEqual(@as(usize, 2), logs.len);
     try testing.expectEqualStrings("test log 1", logs[0].message);
@@ -190,7 +337,12 @@ test "readEmptyTimeRange" {
     try t.writeLog(try LogEntry.init(a, "test log", null));
 
     const logs = try t.readLog(100, 100);
-    defer a.free(logs);
+    defer {
+        for (logs) |*entry| {
+            entry.deinit(a);
+        }
+        a.free(logs);
+    }
 
     try testing.expectEqual(@as(usize, 0), logs.len);
 }
@@ -206,9 +358,55 @@ test "readInvalidTimeRange" {
     try t.writeLog(try LogEntry.init(a, "test log", null));
 
     const logs = try t.readLog(200, 100);
-    defer a.free(logs);
+    defer {
+        for (logs) |*entry| {
+            entry.deinit(a);
+        }
+        a.free(logs);
+    }
 
     try testing.expectEqual(@as(usize, 0), logs.len);
+}
+
+test "flushAndReadSSTable" {
+    const a = testing.allocator;
+    const wal_filename = "test_memtable_flushAndReadSSTable.wal";
+
+    var t = try MemTable.init(a, wal_filename, .{ .flush_threshold = 2 });
+    defer t.deinit(a);
+    defer cleanupTestWalFile(wal_filename);
+
+    const entry1 = try LogEntry.init(a, "test log 1", null);
+
+    // guarantee the sort order by delaying 10 ms
+    std.time.sleep(std.time.ns_per_ms * 10);
+    const entry2 = try LogEntry.init(a, "test log 2", null);
+
+    // guarantee the sort order by delaying 10 ms
+    std.time.sleep(std.time.ns_per_ms * 10);
+    const entry3 = try LogEntry.init(a, "test log 3", null);
+
+    try t.writeLog(entry1);
+    try t.writeLog(entry2); // triggers flush
+    try t.writeLog(entry3);
+
+    try testing.expectEqual(@as(usize, 1), t.entries.items.len);
+    try testing.expectEqual(@as(usize, 1), t.sstable_files.items.len);
+
+    const logs = try t.readLog(0, std.math.maxInt(u64));
+    defer {
+        for (logs) |*entry| {
+            entry.deinit(a);
+        }
+        a.free(logs);
+    }
+
+    // 3 entries returned
+    try testing.expectEqual(@as(usize, 3), logs.len);
+
+    try testing.expectEqualStrings("test log 1", logs[0].message);
+    try testing.expectEqualStrings("test log 2", logs[1].message);
+    try testing.expectEqualStrings("test log 3", logs[2].message);
 }
 
 // Run this test manually with:
@@ -225,7 +423,7 @@ test "writeManyLogs" {
     };
     defer a.free(env_var);
 
-    var t = try MemTable.init(a, wal_filename, .{});
+    var t = try MemTable.init(a, wal_filename, .{ .flush_threshold = 1000 });
     defer t.deinit(a);
     defer cleanupTestWalFile(wal_filename);
 
@@ -246,12 +444,18 @@ test "writeManyLogs" {
     }
     const write_time_ns = timer.read() - write_start_ns;
 
-    try testing.expectEqual(@as(usize, entry_count), t.entries.items.len);
+    // All entries have been flushed to SSTable files.
+    try testing.expectEqual(@as(usize, 0), t.entries.items.len);
 
     // Measure read time
     const read_start_ns = timer.read();
     const logs = try t.readLog(0, std.math.maxInt(u64));
-    defer a.free(logs);
+    defer {
+        for (logs) |*entry| {
+            entry.deinit(a);
+        }
+        a.free(logs);
+    }
     const read_time_ns = timer.read() - read_start_ns;
 
     try testing.expectEqual(@as(usize, entry_count), logs.len);
@@ -292,14 +496,40 @@ test "writeManyLogs" {
     // analysis:
     // - small to 1k message size  contributes more time
     // - 10,000 -> 100,000 entries contributes more time
-    std.log.debug("writeManyLogs: wrote {} entries in {} ns, read in {} ns", .{
-        entry_count,
-        write_time_ns,
-        read_time_ns,
-    });
 
-    // Loose performance check: allow write:read ratio < 2000:1 due to WAL sync
-    try testing.expect(write_time_ns < read_time_ns * 2000);
+    // V4: V3 + flush
+    //
+    //   compared with previous V3 at scale of 10000 entries
+    //     V3 wrote 1388833041ns, read 1147000
+    //     V4 wrote 2504444542ns, read 1478251041 ratio ~1.70
+    //
+    //   compared with previous V3 at scale of 100000 entries (thus 100 SSTable files)
+    //     V3 wrote 17,405,096,417 ns, read     12,050,583 ns i.e., 17.4s write, 12ms  read
+    //     V4 wrote 24,136,889,500 ns, read 18,805,935,500 ns i.e., 24.1s write, 18.8s read
+    //
+    // write:read ratio of V4 is:
+    //   1.70 at  10000 entries
+    //   1.28 at 100000 entries
+    //
+    // analysis: 100 SSTable I/O use a lot of time both when write and read (sequential disk access)
+
+    const ratio = @as(f64, @floatFromInt(write_time_ns)) / @as(f64, @floatFromInt(read_time_ns));
+    std.debug.print(
+        "writeManyLogs (threshold={d}): wrote {} entries in {} ns, read in {} ns, ratio={d:.2}\n",
+        .{ t.config.flush_threshold, entry_count, write_time_ns, read_time_ns, ratio },
+    );
+
+    // TODO future: for a logging system, write:read ratios of 10:1 to 100:1 are typicial for write-heavy workloads
+    //  read performance needs improvement
+
+    try testing.expect(write_time_ns < read_time_ns * 5);
+
+    // Clean up SSTable files
+    for (t.sstable_files.items) |filename| {
+        std.fs.cwd().deleteFile(filename) catch |err| {
+            std.log.warn("Unable to cleanup SSTable {s}, caused by: {}", .{ filename, err });
+        };
+    }
 }
 
 test "writeLogRetryFailure" {

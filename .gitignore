@@ -4,3 +4,9 @@ zig-out/
 .DS_Store
 
 viclau/
+
+.vscode/
+.qoder
+
+# WAL file produced by main.zig
+log.wal

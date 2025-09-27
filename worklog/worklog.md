@@ -74,3 +74,20 @@
 **Deliverables**: Basic LSM-Tree with memtable and SSTable support.
 
 **Dependencies/Notes**: Data Storage section. Defer compaction/indexing. Use binary encoding for SSTables to minimize overhead.
+
+
+# Week 5: Complete Single-Node Prototype
+
+**Goals**: Polish the single-node LSM-Tree and SDK.
+
+**Tasks**:
+
+- ~~Add error handling for resource exhaustion (e.g., disk full) in writes – 2 hours.~~
+- ~~Implement basic client-server setup: Simple TCP server using `std.net` to expose SDK over network (e.g., send/receive LogEntry as JSON) – 3 hours.~~
+- ~~Support client-provided timestamps in protocol (e.g., `{"action":"write","message":"log","timestamp":123,"metadata":{}}`) – 1 hour.~~ move to next week
+- End-to-end tests: Simulate writes/reads over network, including timestamp handling – 2 hours.
+- Documentation: Add comments, README, and protocol spec noting possible timestamp adjustments – 2 hours.
+
+**Deliverables**: Fully functional single-node prototype with network access and client timestamp support.
+
+**Dependencies/Notes**: Completes Development Plan Step 1. Test with multiple clients if time allows. Prepare for Week 6 timestamp adjustments by supporting client timestamps in protocol.

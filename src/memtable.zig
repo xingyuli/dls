@@ -23,6 +23,13 @@ const Config = struct {
     flush_threshold: u32 = 100,
 };
 
+const MemTableError = error{
+    LogEntryTooLarge,
+    DiskFull,
+    OutOfMemory,
+    FileSystemError,
+};
+
 pub const MemTable = struct {
     entries: std.ArrayList(LogEntry),
 
@@ -98,7 +105,7 @@ pub const MemTable = struct {
                 .{ entry.message.len, self.config.max_log_entry_write_size },
             );
 
-            return error.LogEntryTooLarge;
+            return MemTableError.LogEntryTooLarge;
         }
 
         // Write to WAL first for durability
@@ -108,8 +115,21 @@ pub const MemTable = struct {
             self.wal.append(self.entries.allocator, &entry) catch |err| {
                 std.log.warn("WAL append failed (retries left: {d}), caused by: {}", .{ retries, err });
 
-                // No rollback needed, as entries unchanged
-                if (retries == 0) return err;
+                switch (err) {
+                    error.DiskFull => {
+                        // TODO future: Metric increment discards due to disk full
+                        std.log.warn("write_log_discard_disk_full: 1", .{});
+                        if (retries == 0) return MemTableError.DiskFull;
+                    },
+                    error.OutOfMemory => {
+                        std.log.warn("write_log_discard_oom: 1", .{});
+                        if (retries == 0) return MemTableError.OutOfMemory;
+                    },
+                    else => {
+                        std.log.warn("write_log_discard_filesystem: 1", .{});
+                        if (retries == 0) return MemTableError.FileSystemError;
+                    },
+                }
 
                 std.time.sleep(std.time.ns_per_ms * 100);
                 continue;
@@ -375,6 +395,7 @@ test "flushAndReadSSTable" {
     var t = try MemTable.init(a, wal_filename, .{ .flush_threshold = 2 });
     defer t.deinit(a);
     defer cleanupTestWalFile(wal_filename);
+    defer cleanupSstableFiles(t.sstable_files.items);
 
     const entry1 = try LogEntry.init(a, "test log 1", null);
 
@@ -426,6 +447,7 @@ test "writeManyLogs" {
     var t = try MemTable.init(a, wal_filename, .{ .flush_threshold = 1000 });
     defer t.deinit(a);
     defer cleanupTestWalFile(wal_filename);
+    defer cleanupSstableFiles(t.sstable_files.items);
 
     const entry_count = 100_000;
 
@@ -523,13 +545,6 @@ test "writeManyLogs" {
     //  read performance needs improvement
 
     try testing.expect(write_time_ns < read_time_ns * 5);
-
-    // Clean up SSTable files
-    for (t.sstable_files.items) |filename| {
-        std.fs.cwd().deleteFile(filename) catch |err| {
-            std.log.warn("Unable to cleanup SSTable {s}, caused by: {}", .{ filename, err });
-        };
-    }
 }
 
 test "writeLogRetryFailure" {
@@ -545,7 +560,7 @@ test "writeLogRetryFailure" {
 
     // Expect failure and no entries change
     const entry = try LogEntry.init(a, "test log", null);
-    try testing.expectError(error.DiskFull, t.writeLog(entry));
+    try testing.expectError(MemTableError.DiskFull, t.writeLog(entry));
     try testing.expectEqual(@as(usize, 0), t.entries.items.len);
 
     // Expect empty WAL
@@ -575,7 +590,7 @@ test "writeOversizedLog" {
     const entry = try LogEntry.init(a, "1234567890a", null);
     defer entry.deinit(a);
 
-    try testing.expectError(error.LogEntryTooLarge, t.writeLog(entry));
+    try testing.expectError(MemTableError.LogEntryTooLarge, t.writeLog(entry));
 
     try testing.expectEqual(@as(usize, 0), t.entries.items.len);
 }
@@ -709,4 +724,12 @@ fn cleanupTestWalFile(filename: []const u8) void {
     std.fs.cwd().deleteFile(filename) catch |err| {
         std.log.warn("Unable to cleanup the wal file: {s}, caused by: {}", .{ filename, err });
     };
+}
+
+fn cleanupSstableFiles(filenames: [][]u8) void {
+    for (filenames) |filename| {
+        std.fs.cwd().deleteFile(filename) catch |err| {
+            std.log.warn("Unable to cleanup SSTable {s}, caused by: {}", .{ filename, err });
+        };
+    }
 }

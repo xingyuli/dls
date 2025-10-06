@@ -1,4 +1,8 @@
+// Copyright (c) 2025 Vic Lau
+// Licensed under the MIT License
+
 const std = @import("std");
+const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const Connection = std.net.Server.Connection;
 const LogEntry = @import("./model.zig").LogEntry;
@@ -47,9 +51,6 @@ pub const Server = struct {
         const addr = try std.net.Address.resolveIp(address, port);
         const server = try addr.listen(.{ .reuse_address = true });
 
-        // TODO is is possible to know the addr of server? rather than the addr of pointer to server?
-        std.debug.print("in init addr of server: {*}\n", .{&server});
-
         return Server{
             .allocator = allocator,
             .memtable = memtable,
@@ -59,9 +60,7 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
-        std.debug.print("in deinit addr of self.s: {*}\n", .{&self.s});
         self.s.deinit();
-        std.debug.print("server deinit called\n", .{});
     }
 
     pub fn stop(self: *Server) void {
@@ -189,14 +188,13 @@ pub const Server = struct {
 
         const metadata = obj.get("metadata");
 
-        const metadata_json = if (metadata) |m|
-            try std.json.stringifyAlloc(self.allocator, m, .{})
-        else
-            null;
-        defer if (metadata_json) |m| self.allocator.free(m);
+        const entry_arena = self.memtable.entries.allocator;
 
-        const entry = try LogEntry.init(self.allocator, message.string, metadata_json);
-        // TODO next week: release memory when error happened, .e.g., errdefer entry.deinit();
+        const entry = try LogEntry.init(
+            entry_arena,
+            try entry_arena.dupe(u8, message.string),
+            if (metadata) |m| try std.json.stringifyAlloc(entry_arena, m, .{}) else null,
+        );
 
         self.memtable.writeLog(entry) catch |err| {
             std.log.warn("Failed to write log: {}", .{err});
@@ -228,33 +226,22 @@ pub const Server = struct {
             return;
         };
 
-        const logs = try self.memtable.readLog(start_ts_u64, end_ts_u64);
-        defer {
-            for (logs) |*e| {
-                // TODO next week: memtable should provide deallocation API for returned slice, because client code have no idea
-                // about the underlying allocator
-                e.deinit(self.memtable.entries.allocator);
-            }
-            self.memtable.entries.allocator.free(logs);
-        }
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
 
-        // TODO next week: why we need to allocate new memory for each log entry? rather than stringify the `logs` slice directly?
-        var log_list = std.ArrayList(std.json.Value).init(self.allocator);
-        defer log_list.deinit();
-        for (logs) |e| {
-            const serialized = try e.ser(self.allocator);
-            defer self.allocator.free(serialized);
+        const allocator = arena.allocator();
 
-            const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, serialized, .{});
-            defer parsed.deinit();
+        const logs = try self.memtable.readLog(
+            allocator,
+            start_ts_u64,
+            end_ts_u64,
+        );
 
-            try log_list.append(parsed.value);
-        }
+        var response = std.ArrayList(u8).init(allocator);
 
-        var response = std.ArrayList(u8).init(self.allocator);
-        defer response.deinit();
-
-        try std.json.stringify(.{ .status = "ok", .data = log_list.items }, .{}, response.writer());
+        // TODO future: for large ranges, this could OOM the arena; consider streaming (write array open, per-entry
+        //   stringify, close).
+        try std.json.stringify(.{ .status = "ok", .data = logs }, .{}, response.writer());
         try conn.stream.writeAll(response.items);
         try conn.stream.writeAll("\n");
     }
@@ -263,6 +250,7 @@ pub const Server = struct {
         return switch (v) {
             .integer => if (v.integer >= 0) @as(u64, @intCast(v.integer)) else error.InvalidU64,
             .number_string => std.fmt.parseInt(u64, v.number_string, 10) catch error.InvalidU64,
+            .string => std.fmt.parseInt(u64, v.string, 10) catch error.InvalidU64,
             else => error.InvalidU64,
         };
     }
@@ -282,13 +270,12 @@ pub const Server = struct {
     }
 };
 
-// TODO next week. cover read as well
-test "serverWrite" {
+test "serverWriteAndRead" {
     const a = std.testing.allocator;
-    const wal_filename = "test_server_serverWrite.wal";
+    const wal_filename = "test_server_serverWriteAndRead.wal";
 
     var memtable = try MemTable.init(a, wal_filename, .{});
-    defer memtable.deinit(a);
+    defer memtable.deinit();
     defer std.fs.cwd().deleteFile(wal_filename) catch {};
 
     var server = try Server.init(a, &memtable, "127.0.0.1", 5260);
@@ -297,15 +284,60 @@ test "serverWrite" {
     const server_thread = try std.Thread.spawn(.{}, Server.serve, .{&server});
     defer server_thread.join();
 
+    // Give server time to start listening
     std.time.sleep(std.time.ns_per_ms * 100);
 
-    // Test client: Write
     const addr = try std.net.Address.resolveIp("127.0.0.1", 5260);
     var conn = try std.net.tcpConnectToAddress(addr);
     defer conn.close();
 
-    const write_req = "{\"action\":\"write\",\"message\":\"test log\",\"metadata\":{\"level\":\"INFO\"}}\n";
-    try conn.writeAll(write_req);
+    // Helper to send request and read response line
+    const SendRecvHelper = struct {
+        conn: std.net.Stream,
+        allocator: Allocator,
 
+        const Self = @This();
+
+        pub fn sendRecv(self: *Self, req: []const u8) ![]u8 {
+            try self.conn.writeAll(req);
+            const result = try self.conn.reader().readUntilDelimiterOrEofAlloc(self.allocator, '\n', 2048);
+            return result.?;
+        }
+    };
+    var helper = SendRecvHelper{ .conn = conn, .allocator = a };
+
+    // Test client: Write
+    const write_req = "{\"action\":\"write\",\"message\":\"test log\",\"metadata\":{\"level\":\"INFO\"}}\n";
+    const write_resp = try helper.sendRecv(write_req);
+    defer a.free(write_resp);
+
+    try testing.expect(std.mem.containsAtLeast(u8, write_resp, 1, "{\"status\":\"ok\"}"));
+
+    // Test client: read (catches the log just written)
+    const now_ms = @as(u64, @intCast(std.time.milliTimestamp()));
+    const read_req = try std.fmt.allocPrint(
+        a,
+        "{{\"action\":\"read\",\"start_ts\":0,\"end_ts\":{d}}}\n",
+        .{now_ms + 1000},
+    );
+    defer a.free(read_req);
+
+    const read_resp_raw = try helper.sendRecv(read_req);
+    defer a.free(read_resp_raw);
+
+    const read_resp = try std.json.parseFromSlice(std.json.Value, a, read_resp_raw, .{});
+    defer read_resp.deinit();
+
+    const obj = read_resp.value.object;
+    try testing.expectEqualStrings("ok", obj.get("status").?.string);
+
+    const data = obj.get("data").?.array;
+    try testing.expectEqual(@as(usize, 1), data.items.len);
+
+    const first_log = data.items[0].object;
+    try testing.expectEqualStrings("test log", first_log.get("message").?.string);
+    try testing.expectEqualStrings("INFO", first_log.get("metadata").?.object.get("level").?.string);
+
+    // Graceful stop
     server.stop();
 }

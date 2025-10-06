@@ -1,11 +1,12 @@
 .zig-cache/
 zig-out/
 
+.vscode/
+.idea/
 .DS_Store
 
 viclau/
 
-.vscode/
 .qoder
 
 # WAL file produced by main.zig

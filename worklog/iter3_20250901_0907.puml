@@ -37,8 +37,12 @@ class Wal {
 }
 
 note right of Wal
-    crc32 | LogEntry:deser | \n
-    other lines ...
+  Wal file
+  ---
+  crc32:u32 | LogEntry.ser | \n
+  line 2 ...
+  line 3 ...
+  ...
 end note
 
 MemTable *- LogEntry

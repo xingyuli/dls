@@ -75,6 +75,8 @@
 
 **Dependencies/Notes**: Data Storage section. Defer compaction/indexing. Use binary encoding for SSTables to minimize overhead.
 
+**Completed at**: 2025.09.11
+
 
 # Week 5: Complete Single-Node Prototype
 
@@ -85,9 +87,23 @@
 - ~~Add error handling for resource exhaustion (e.g., disk full) in writes – 2 hours.~~
 - ~~Implement basic client-server setup: Simple TCP server using `std.net` to expose SDK over network (e.g., send/receive LogEntry as JSON) – 3 hours.~~
 - ~~Support client-provided timestamps in protocol (e.g., `{"action":"write","message":"log","timestamp":123,"metadata":{}}`) – 1 hour.~~ move to next week
-- End-to-end tests: Simulate writes/reads over network, including timestamp handling – 2 hours.
-- Documentation: Add comments, README, and protocol spec noting possible timestamp adjustments – 2 hours.
+- ~~End-to-end tests: Simulate writes/reads over network, including timestamp handling – 2 hours.~~
+- ~~Documentation: Add comments, README, and protocol spec noting possible timestamp adjustments – 2 hours.~~
 
 **Deliverables**: Fully functional single-node prototype with network access and client timestamp support.
 
 **Dependencies/Notes**: Completes Development Plan Step 1. Test with multiple clients if time allows. Prepare for Week 6 timestamp adjustments by supporting client timestamps in protocol.
+
+**Tasks of an extra week**
+
+- ~~Extend `server.zig` test to cover both write and read operations over TCP/JSON protocol, verifying response JSON for message and metadata.~~
+- ~~Add documentation clarifications in `model.zig` for `LogEntry.init` and `LogEntry.deser`, specifying memory lifetime and arena ownership requirements.~~
+- ~~Add documentation clarifications in `memtable.zig` for `writeLog` and `flush`, detailing allocator usage and write-flush cycle lifecycle.~~
+- ~~Defer WAL truncation to avoid duplicate entries on crash recovery, retaining WAL contents post-flush.~~
+- ~~Other optimizations to reduce memory allocations and improve performance.~~
+- ~~Run `writeManyLogs` with V5 (arena, flush_threshold=1,000), achieving ~114–122 µs/write, ~29–30 µs/read at 100k entries, ratio ~4:1~~
+
+**Completed at**:
+
+- Basic write and read operations: 2025.09.27
+- All the tasks: 2025.10.06

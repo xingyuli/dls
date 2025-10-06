@@ -7,11 +7,7 @@ const Allocator = std.mem.Allocator;
 
 pub var timestamp_fn: *const fn () i64 = std.time.milliTimestamp;
 
-/// Allocators are passing around to functions for these reasons:
-/// - reduce memory usage, a pointer to an allocator typically uses 8 bytes on
-///   64-bit system
-/// - leave possiblity for future optimization, functions can use different
-///   allocators for their purporse
+/// Allocators are passed explicitly to enable arena-based ownership (e.g., in MemTable), reducing global state while allowing future allocator swaps for optimization.
 pub const LogEntry = struct {
 
     // milli ts
@@ -20,24 +16,18 @@ pub const LogEntry = struct {
     message: []const u8,
 
     // TODO future: store source ts in metadata
-    // TODO next week: use `?std.json.Value` for performance ?
-    metadata: ?std.json.Parsed(std.json.Value),
+    // `deser` relies on a default value for missing field
+    metadata: ?std.json.Value = null,
 
     // client code or agent should stick with 1
     version: u8,
 
-    // Helper struct for serialization/deserialization
-    const SerializableLogEntry = struct {
-        timestamp: u64,
-        message: []const u8,
-
-        // `deser` relies on a default value for missing field
-        metadata: ?std.json.Value = null,
-
-        version: u8,
-    };
-
-    pub fn init(allocator: Allocator, message: []const u8, metadata_json: ?[]const u8) !LogEntry {
+    /// Initializes a LogEntry with the current timestamp, message, and optional metadata.
+    /// The `message` and `metadata_json` slices must outlive the LogEntry (or the arena's lifetime),
+    /// as they are stored by reference. For safety and simplicity, they should be allocated by `arena`
+    /// (e.g., via `arena.dupe` or `std.json.stringifyAlloc`), as the arena typically manages LogEntry
+    /// lifetimes in MemTable, resetting on flush to free all memory.
+    pub fn init(arena: Allocator, message: []const u8, metadata_json: ?[]const u8) !LogEntry {
         const ts_i64 = timestamp_fn();
         if (ts_i64 < 0) {
             // Handle pre-1970 timestamps
@@ -46,42 +36,27 @@ pub const LogEntry = struct {
 
         const ts_u64 = @as(u64, @intCast(ts_i64));
 
-        const owned_message = try allocator.dupe(u8, message);
-
-        var metadata: ?std.json.Parsed(std.json.Value) = null;
+        var metadata: ?std.json.Value = null;
         if (metadata_json) |it| {
-            metadata = try std.json.parseFromSlice(std.json.Value, allocator, it, .{});
+            metadata = try std.json.parseFromSliceLeaky(std.json.Value, arena, it, .{});
         }
 
         return LogEntry{
             .timestamp = ts_u64,
-            .message = owned_message,
+            .message = message,
             .metadata = metadata,
             .version = 1,
         };
     }
 
-    pub fn deinit(self: *const LogEntry, allocator: Allocator) void {
-        allocator.free(self.message);
-        if (self.metadata) |meta| {
-            meta.deinit();
-        }
-    }
-
-    /// Call ownes the returned memory.
+    /// Serializes the LogEntry to JSON, using `allocator` for the returned slice.
+    /// Call owns the returned memory.
     pub fn ser(self: *const LogEntry, allocator: Allocator) ![]u8 {
         var out = std.ArrayList(u8).init(allocator);
         defer out.deinit();
 
-        const serializable = SerializableLogEntry{
-            .timestamp = self.timestamp,
-            .message = self.message,
-            .metadata = if (self.metadata) |meta| meta.value else null,
-            .version = self.version,
-        };
-
         try std.json.stringify(
-            serializable,
+            self,
 
             // reduce serialized memory by omiting null optional fields,
             // `metadata` in fact
@@ -93,38 +68,26 @@ pub const LogEntry = struct {
         return try out.toOwnedSlice();
     }
 
-    pub fn deser(allocator: Allocator, serialized: []const u8) !LogEntry {
-        const deserialized = try std.json.parseFromSlice(
-            SerializableLogEntry,
-            allocator,
+    /// Deserializes a JSON string into a LogEntry, using `arena` for allocations.
+    /// The `serialized` slice must remain valid until the next `MemTable.flush`,
+    /// as LogEntry stores references to its contents. Typically, `arena` is the
+    /// MemTable's arena, which manages the lifecycle of deserialized entries.
+    pub fn deser(arena: Allocator, serialized: []const u8) !LogEntry {
+        return try std.json.parseFromSliceLeaky(
+            LogEntry,
+            arena,
             serialized,
             .{},
         );
-        defer deserialized.deinit();
-
-        const dv = deserialized.value;
-
-        const owned_message = try allocator.dupe(u8, dv.message);
-
-        var owned_metadata: ?std.json.Parsed(std.json.Value) = null;
-        if (dv.metadata) |meta| {
-            owned_metadata = try cloneMetadata(allocator, meta);
-        }
-
-        return LogEntry{
-            .timestamp = dv.timestamp,
-            .message = owned_message,
-            .metadata = owned_metadata,
-            .version = dv.version,
-        };
     }
 
-    pub fn clone(self: *const LogEntry, allocator: Allocator) !LogEntry {
-        const owned_message = try allocator.dupe(u8, self.message);
+    pub fn clone(self: *const LogEntry, arena: Allocator) !LogEntry {
+        const owned_message = try arena.dupe(u8, self.message);
+        errdefer arena.free(owned_message);
 
-        var owned_metadata: ?std.json.Parsed(std.json.Value) = null;
-        if (self.metadata) |meta| {
-            owned_metadata = try cloneMetadata(allocator, meta.value);
+        var owned_metadata: ?std.json.Value = null;
+        if (self.metadata) |m| {
+            owned_metadata = try std.json.parseFromValueLeaky(std.json.Value, arena, m, .{});
         }
 
         return LogEntry{
@@ -133,15 +96,6 @@ pub const LogEntry = struct {
             .metadata = owned_metadata,
             .version = self.version,
         };
-    }
-
-    /// rebuild metadata: re-stringify + re-parse to own the memory
-    fn cloneMetadata(allocator: Allocator, meta_value: std.json.Value) !std.json.Parsed(std.json.Value) {
-        var out = std.ArrayList(u8).init(allocator);
-        defer out.deinit();
-
-        try std.json.stringify(meta_value, .{}, out.writer());
-        return try std.json.parseFromSlice(std.json.Value, allocator, out.items, .{});
     }
 };
 
@@ -163,7 +117,12 @@ test "initInvalidTimestamp" {
 }
 
 test "serWithoutMetadata" {
-    const allocator = testing.allocator;
+    const t_allocator = testing.allocator;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const allocator = arena.allocator();
 
     // Mock timestamp_fn
     const mock_fn = struct {
@@ -175,10 +134,9 @@ test "serWithoutMetadata" {
     timestamp_fn = mock_fn;
 
     const entry = try LogEntry.init(allocator, "test log", null);
-    defer entry.deinit(allocator);
 
-    const s = try entry.ser(allocator);
-    defer allocator.free(s);
+    const s = try entry.ser(t_allocator);
+    defer t_allocator.free(s);
 
     try testing.expectEqualStrings(
         "{\"timestamp\":123456789,\"message\":\"test log\",\"version\":1}",
@@ -190,7 +148,12 @@ test "serWithoutMetadata" {
 }
 
 test "serWithMetadata" {
-    const allocator = testing.allocator;
+    const t_allocator = testing.allocator;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const allocator = arena.allocator();
 
     // Mock timestamp_fn
     const mock_fn = struct {
@@ -206,10 +169,9 @@ test "serWithMetadata" {
         "INFO | test log",
         "{\"level\": \"INFO\"}",
     );
-    defer entry.deinit(allocator);
 
-    const s = try entry.ser(allocator);
-    defer allocator.free(s);
+    const s = try entry.ser(t_allocator);
+    defer t_allocator.free(s);
 
     try testing.expectEqualStrings(
         "{\"timestamp\":123456789,\"message\":\"INFO | test log\",\"metadata\":{\"level\":\"INFO\"},\"version\":1}",
@@ -221,84 +183,135 @@ test "serWithMetadata" {
 }
 
 test "deserWithoutMetadata" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const allocator = arena.allocator();
+
     const entry_json = "{\"timestamp\":123456789,\"message\":\"INFO | test log\",\"version\":1}";
-    const entry = try LogEntry.deser(testing.allocator, entry_json);
-    defer entry.deinit(testing.allocator);
+    const entry = try LogEntry.deser(allocator, entry_json);
 
     try testing.expectEqual(@as(u64, 123456789), entry.timestamp);
     try testing.expectEqualStrings("INFO | test log", entry.message);
-    try testing.expectEqual(@as(?std.json.Parsed(std.json.Value), null), entry.metadata);
+    try testing.expectEqual(@as(?std.json.Value, null), entry.metadata);
     try testing.expectEqual(@as(u8, 1), entry.version);
 }
 
 test "deserWithNullMetadata" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const allocator = arena.allocator();
+
     const entry_json = "{\"timestamp\":123456789,\"message\":\"INFO | test log\",\"metadata\":null,\"version\":1}";
-    const entry = try LogEntry.deser(testing.allocator, entry_json);
-    defer entry.deinit(testing.allocator);
+    const entry = try LogEntry.deser(allocator, entry_json);
 
     try testing.expectEqual(@as(u64, 123456789), entry.timestamp);
     try testing.expectEqualStrings("INFO | test log", entry.message);
-    try testing.expectEqual(@as(?std.json.Parsed(std.json.Value), null), entry.metadata);
+    try testing.expectEqual(@as(?std.json.Value, null), entry.metadata);
     try testing.expectEqual(@as(u8, 1), entry.version);
 }
 
 test "deserWithMetadata" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const allocator = arena.allocator();
+
     const entry_json = "{\"timestamp\":123456789,\"message\":\"INFO | test log\",\"metadata\":{\"level\":\"INFO\"},\"version\":1}";
-    const entry = try LogEntry.deser(testing.allocator, entry_json);
-    defer entry.deinit(testing.allocator);
+    const entry = try LogEntry.deser(allocator, entry_json);
 
     try testing.expectEqual(@as(u64, 123456789), entry.timestamp);
     try testing.expectEqualStrings("INFO | test log", entry.message);
 
     try testing.expect(entry.metadata != null);
-    if (entry.metadata) |meta| {
-        try testing.expect(meta.value == .object);
-        try testing.expectEqualStrings("INFO", meta.value.object.get("level").?.string);
+    if (entry.metadata) |m| {
+        try testing.expect(m == .object);
+        try testing.expectEqualStrings("INFO", m.object.get("level").?.string);
     }
 
     try testing.expectEqual(@as(u8, 1), entry.version);
 }
 
+test "deserFromFile" {
+    const t_allocator = testing.allocator;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const allocator = arena.allocator();
+
+    const filename = "test_model_deserFromFile.tmp";
+    try std.fs.cwd().writeFile(.{
+        .sub_path = filename,
+        .data = "{\"timestamp\":123456789,\"message\":\"INFO | test log\",\"metadata\":{\"level\":\"INFO\"},\"version\":1}",
+    });
+
+    defer std.fs.cwd().deleteFile(filename) catch |err| {
+        std.log.warn("Unable to cleanup the file: {s}, caused by: {}", .{ filename, err });
+    };
+
+    const file_content = try std.fs.cwd().readFileAlloc(t_allocator, filename, 100);
+    defer t_allocator.free(file_content);
+
+    const entry = try LogEntry.deser(allocator, file_content);
+
+    try testing.expectEqualStrings("INFO | test log", entry.message);
+    try testing.expectEqualStrings("INFO", entry.metadata.?.object.get("level").?.string);
+}
+
 test "deserMissingRequiredFields" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const allocator = arena.allocator();
+
     const entry_json = "{\"version\":1}";
-    const result = LogEntry.deser(testing.allocator, entry_json);
+    const result = LogEntry.deser(allocator, entry_json);
 
     try testing.expectError(std.json.ParseFromValueError.MissingField, result);
 }
 
 test "deserInvalidJSON" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const allocator = arena.allocator();
+
     const entry_json = "{\"timestamp\":123456789,\"message\":\"INFO | test log\",\"metadata\":{invalid},\"version\":1}";
-    const result = LogEntry.deser(testing.allocator, entry_json);
+    const result = LogEntry.deser(allocator, entry_json);
 
     try testing.expectError(error.SyntaxError, result);
 }
 
 test "cloneWithoutMetadata" {
-    const entry = try LogEntry.init(testing.allocator, "test log", null);
-    defer entry.deinit(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
 
-    const cloned = try entry.clone(testing.allocator);
-    defer cloned.deinit(testing.allocator);
+    const allocator = arena.allocator();
+
+    const entry = try LogEntry.init(allocator, "test log", null);
+
+    const cloned = try entry.clone(allocator);
 
     try testing.expectEqualStrings("test log", cloned.message);
     try testing.expect(cloned.metadata == null);
 }
 
 test "cloneWithMetadata" {
-    const entry = try LogEntry.init(
-        testing.allocator,
-        "test log",
-        "{\"level\":\"INFO\"}",
-    );
-    defer entry.deinit(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
 
-    const cloned = try entry.clone(testing.allocator);
-    defer cloned.deinit(testing.allocator);
+    const allocator = arena.allocator();
+
+    const entry = try LogEntry.init(allocator, "test log", "{\"level\":\"INFO\"}");
+
+    const cloned = try entry.clone(allocator);
 
     try testing.expectEqualStrings("test log", cloned.message);
     try testing.expect(cloned.metadata != null);
 
-    if (cloned.metadata) |meta| {
-        try testing.expectEqualStrings("INFO", meta.value.object.get("level").?.string);
+    if (cloned.metadata) |m| {
+        try testing.expectEqualStrings("INFO", m.object.get("level").?.string);
     }
 }

@@ -3,12 +3,12 @@
 class LogEntry {
   timestamp : u64
   message : []const u8
-  metadata : ?std.json.Parsed<std.json.Value>
+  metadata : ?std.json.Value
   version : u8
 
   + ser(self: *const LogEntry, a: Allocator) ![]u8
-  + deser(a: Allocator, serialized: []const u8) !LogEntry
-  + clone(self: *const LogEntry, a: Allocator) !LogEntry
+  + deser(arena: Allocator, serialized: []const u8) !LogEntry
+  + clone(self: *const LogEntry, arena: Allocator) !LogEntry
 }
 
 note right of LogEntry::timestamp
@@ -16,14 +16,15 @@ note right of LogEntry::timestamp
 end note
 
 class MemTable {
+  arena: *ArenaAllocator
   {field} entries : std.ArrayList(LogEntry)
   wal: Wal
   {field} sstable_files : std.ArrayList([]u8)
   config: Config
 
   + writeLog(self: *MemTable, entry: LogEntry) !void
-  + readLog(self: *const MemTable, start_ts: u64, end_ts: u64) ![]const LogEntry
-  - recover(self: *MemTable, a: Allocator, wal_filename: []const u8) !void
+  + readLog(self: *const MemTable, arena: Allocator, start_ts: u64, end_ts: u64) ![]const LogEntry
+  - recover(self: *MemTable, wal_filename: []const u8) !void
   - writeLogRecover(self: *MemTable, entry: LogEntry) !void
   - findInsertIndex(self: *const MemTable, timestamp: u64) usize
   - flush(self: *MemTable) !void
@@ -68,5 +69,19 @@ note right of MemTable
   line 3 ...
   ...
 end note
+
+class Server {
+  allocator: Allocator
+  memtable: *MemTable
+  {field} should_stop: std.atomic.Value(bool)
+
+  + serve(self: *Server) !void
+  + stop(self: *Server) void
+  - handleConnection(self: *Server, conn: Connection) !void
+  - handleWriteRequest(self: *Server, conn: Connection, obj: std.json.ObjectMap) !void
+  - handleReadRequest(self: *Server, conn: Connection, obj: std.json.ObjectMap) !void
+}
+
+Server --> MemTable
 
 @enduml

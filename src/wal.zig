@@ -42,6 +42,8 @@ pub const Wal = struct {
         const s = try entry.ser(allocator);
         defer allocator.free(s);
 
+        // TODO future `f.writeAll` is deprecated but new std.Io.Writer API is inconvenient
+
         const crc = std.hash.Crc32.hash(s);
         try self.f.writeAll(&std.mem.toBytes(crc));
 

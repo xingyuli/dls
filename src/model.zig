@@ -52,20 +52,14 @@ pub const LogEntry = struct {
     /// Serializes the LogEntry to JSON, using `allocator` for the returned slice.
     /// Call owns the returned memory.
     pub fn ser(self: *const LogEntry, allocator: Allocator) ![]u8 {
-        var out = std.ArrayList(u8).init(allocator);
-        defer out.deinit();
-
-        try std.json.stringify(
+        return try std.json.Stringify.valueAlloc(
+            allocator,
             self,
 
-            // reduce serialized memory by omiting null optional fields,
+            // reduce serialized memory by omitting null optional fields,
             // `metadata` in fact
             .{ .emit_null_optional_fields = false },
-
-            out.writer(),
         );
-
-        return try out.toOwnedSlice();
     }
 
     /// Deserializes a JSON string into a LogEntry, using `arena` for allocations.

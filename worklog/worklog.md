@@ -101,9 +101,18 @@
 - ~~Add documentation clarifications in `memtable.zig` for `writeLog` and `flush`, detailing allocator usage and write-flush cycle lifecycle.~~
 - ~~Defer WAL truncation to avoid duplicate entries on crash recovery, retaining WAL contents post-flush.~~
 - ~~Other optimizations to reduce memory allocations and improve performance.~~
-- ~~Run `writeManyLogs` with V5 (arena, flush_threshold=1,000), achieving ~114–122 µs/write, ~29–30 µs/read at 100k entries, ratio ~4:1~~
+- ~~Run `writeManyLogs` with V5 (arena, flush_threshold=1,000), achieving ~114–122 µs/write, ~29–30 µs/read at 100k entries, ratio ~4:1 .~~
 
 **Completed at**:
 
 - Basic write and read operations: 2025.09.27
 - All the tasks: 2025.10.06
+
+# Extra Week: upgrade from 0.14.1 to 0.15.1
+
+- ~~upgrade to 0.15.1~~
+  - ~~use the new std.Io.Reader API~~
+  - ~~other updates, e.g., json stringify, array list changes~~
+- ~~re-run `writeManyLogs` test~~
+
+**Completed at**: 2025.10.15

@@ -71,15 +71,15 @@ pub const Server = struct {
         while (!self.should_stop.load(.acquire)) {
             const conn = self.s.accept() catch |err| {
                 std.log.warn("Failed to accept connection: {}", .{err});
-                std.time.sleep(std.time.ns_per_ms * 100); // Prevent tight loop
+                std.Thread.sleep(std.time.ns_per_ms * 100); // Prevent tight loop
                 continue;
             };
             defer conn.stream.close();
 
-            std.log.info("New connection from {}", .{conn.address});
+            std.log.info("New connection from {f}", .{conn.address});
 
             self.handleConnection(conn) catch |err| {
-                std.log.warn("Error handling connection from {}: {}", .{ conn.address, err });
+                std.log.warn("Error handling connection from {f}: {}", .{ conn.address, err });
             };
         }
     }
@@ -97,70 +97,66 @@ pub const Server = struct {
     fn handleConnection(self: *Server, conn: Connection) !void {
         const max_buf_size = self.memtable.config.max_log_entry_write_size + max_overhead;
 
-        const reader = conn.stream.reader();
+        const buffer = try self.allocator.alloc(u8, max_buf_size);
+        defer self.allocator.free(buffer);
+
+        var conn_reader = conn.stream.reader(buffer);
+        const reader: *std.Io.Reader = conn_reader.interface();
 
         while (true) {
-            const line = reader.readUntilDelimiterOrEofAlloc(
-                self.allocator,
-                '\n',
-                max_buf_size,
-            ) catch |err| switch (err) {
+            if (reader.takeDelimiterExclusive('\n')) |line| {
+                const trimmed_line = std.mem.trim(u8, line, "\t\n\r");
+                if (trimmed_line.len == 0) {
+                    std.log.info("Ignoring empty or whitespace-only line from {f}", .{conn.address});
+                    continue;
+                }
+
+                const request = std.json.parseFromSlice(
+                    std.json.Value,
+                    self.allocator,
+                    line,
+                    .{},
+                ) catch |err| {
+                    std.log.warn("JSON parse error: {}", .{err});
+                    try self.sendErr(conn, .invalid_json, .{ .message = err });
+                    continue;
+                };
+                defer request.deinit();
+
+                const obj = request.value.object;
+                const action = obj.get("action") orelse {
+                    try self.sendErr(conn, .missing_action, .{});
+                    continue;
+                };
+
+                if (std.meta.stringToEnum(ProtocolAction, action.string)) |pa| {
+                    switch (pa) {
+                        .write => try self.handleWriteRequest(conn, obj),
+                        .read => try self.handleReadRequest(conn, obj),
+                    }
+                } else {
+                    std.log.warn("Unknown action: {s}", .{action.string});
+                    try self.sendErr(
+                        conn,
+                        .unknown_action,
+                        .{ .given_action = action.string, .supported_actions = ProtocolAction.all_actions },
+                    );
+                }
+            } else |err| switch (err) {
+                error.EndOfStream => {
+                    std.log.info("Connection closed by client {f}", .{conn.address});
+                    break;
+                },
                 error.StreamTooLong => {
                     std.log.warn("Rejected oversized request (> {d} bytes)", .{max_buf_size});
                     try self.sendErr(conn, .request_too_large, .{ .max_size = max_buf_size, .unit = "byte" });
                     continue;
                 },
-                error.BrokenPipe, error.ConnectionResetByPeer => {
-                    std.log.info("Connection closed by client {}", .{conn.address});
-                    break;
-                },
-                else => {
+                error.ReadFailed => {
                     std.log.warn("Read error: {}", .{err});
                     try self.sendErr(conn, .read_error, .{});
                     continue;
                 },
-            } orelse {
-                std.log.info("Connection closed by client {} (empty request)", .{conn.address});
-                break;
-            };
-            defer self.allocator.free(line);
-
-            const trimmed_line = std.mem.trim(u8, line, "\t\n\r");
-            if (trimmed_line.len == 0) {
-                std.log.info("Ignoring empty or whitespace-only line from {}", .{conn.address});
-                continue;
-            }
-
-            const request = std.json.parseFromSlice(
-                std.json.Value,
-                self.allocator,
-                line,
-                .{},
-            ) catch |err| {
-                std.log.warn("JSON parse error: {}", .{err});
-                try self.sendErr(conn, .invalid_json, .{ .message = err });
-                continue;
-            };
-            defer request.deinit();
-
-            const obj = request.value.object;
-            const action = obj.get("action") orelse {
-                try self.sendErr(conn, .missing_action, .{});
-                continue;
-            };
-
-            if (std.meta.stringToEnum(ProtocolAction, action.string)) |pa| {
-                switch (pa) {
-                    .write => try self.handleWriteRequest(conn, obj),
-                    .read => try self.handleReadRequest(conn, obj),
-                }
-            } else {
-                std.log.warn("Unknown action: {s}", .{action.string});
-                try self.sendErr(
-                    conn,
-                    .unknown_action,
-                    .{ .given_action = action.string, .supported_actions = ProtocolAction.all_actions },
-                );
             }
         }
     }
@@ -188,12 +184,12 @@ pub const Server = struct {
 
         const metadata = obj.get("metadata");
 
-        const entry_arena = self.memtable.entries.allocator;
+        const entry_arena = self.memtable.entry_allocator;
 
         const entry = try LogEntry.init(
             entry_arena,
             try entry_arena.dupe(u8, message.string),
-            if (metadata) |m| try std.json.stringifyAlloc(entry_arena, m, .{}) else null,
+            if (metadata) |m| try std.json.Stringify.valueAlloc(entry_arena, m, .{}) else null,
         );
 
         self.memtable.writeLog(entry) catch |err| {
@@ -237,12 +233,10 @@ pub const Server = struct {
             end_ts_u64,
         );
 
-        var response = std.ArrayList(u8).init(allocator);
-
         // TODO future: for large ranges, this could OOM the arena; consider streaming (write array open, per-entry
         //   stringify, close).
-        try std.json.stringify(.{ .status = "ok", .data = logs }, .{}, response.writer());
-        try conn.stream.writeAll(response.items);
+        const resp_json = try std.json.Stringify.valueAlloc(allocator, .{ .status = "ok", .data = logs }, .{});
+        try conn.stream.writeAll(resp_json);
         try conn.stream.writeAll("\n");
     }
 
@@ -258,7 +252,7 @@ pub const Server = struct {
     fn sendErr(self: *Server, conn: Connection, err: ErrorCode, detail: anytype) !void {
         const has_any_detail = @typeInfo(@TypeOf(detail)).@"struct".fields.len > 0;
 
-        const resp = try std.json.stringifyAlloc(
+        const resp = try std.json.Stringify.valueAlloc(
             self.allocator,
             if (has_any_detail) .{ .status = "error", .errcode = @tagName(err), .detail = detail } else .{ .status = "error", .errcode = @tagName(err) },
             .{},
@@ -285,7 +279,7 @@ test "serverWriteAndRead" {
     defer server_thread.join();
 
     // Give server time to start listening
-    std.time.sleep(std.time.ns_per_ms * 100);
+    std.Thread.sleep(std.time.ns_per_ms * 100);
 
     const addr = try std.net.Address.resolveIp("127.0.0.1", 5260);
     var conn = try std.net.tcpConnectToAddress(addr);
@@ -300,8 +294,14 @@ test "serverWriteAndRead" {
 
         pub fn sendRecv(self: *Self, req: []const u8) ![]u8 {
             try self.conn.writeAll(req);
-            const result = try self.conn.reader().readUntilDelimiterOrEofAlloc(self.allocator, '\n', 2048);
-            return result.?;
+
+            var buf: [1024]u8 = undefined;
+            var conn_reader = self.conn.reader(&buf);
+            const reader: *std.Io.Reader = conn_reader.interface();
+
+            const line = reader.takeDelimiterExclusive('\n') catch unreachable;
+
+            return self.allocator.dupe(u8, line);
         }
     };
     var helper = SendRecvHelper{ .conn = conn, .allocator = a };

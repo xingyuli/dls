@@ -11,7 +11,7 @@
 - **Tests**: Comprehensive unit and end-to-end tests for model, memtable, WAL, and server.
 
 ## Setup
-1. **Install Zig**: Use Zig 0.14.0 or later. Download from [ziglang.org](https://ziglang.org/download/).
+1. **Install Zig**: Use Zig 0.15.1. Download from [ziglang.org](https://ziglang.org/download/).
 2. **Clone Repository**:
 ```bash
 git clone <repo-url>

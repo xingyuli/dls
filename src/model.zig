@@ -10,24 +10,35 @@ pub var timestamp_fn: *const fn () i64 = std.time.milliTimestamp;
 /// Allocators are passed explicitly to enable arena-based ownership (e.g., in MemTable), reducing global state while allowing future allocator swaps for optimization.
 pub const LogEntry = struct {
 
-    // milli ts
+    // server timestamp in millis
     timestamp: u64,
+
+    // TODO future: build indices on source_ts
+    // source timestamp in millis
+    source_ts: u64,
 
     message: []const u8,
 
-    // TODO future: store source ts in metadata
-    // `deser` relies on a default value for missing field
     metadata: ?std.json.Value = null,
 
     // client code or agent should stick with 1
     version: u8,
 
-    /// Initializes a LogEntry with the current timestamp, message, and optional metadata.
+    /// Initializes a LogEntry with the source timestamp, message, and optional metadata.
     /// The `message` and `metadata_json` slices must outlive the LogEntry (or the arena's lifetime),
     /// as they are stored by reference. For safety and simplicity, they should be allocated by `arena`
-    /// (e.g., via `arena.dupe` or `std.json.stringifyAlloc`), as the arena typically manages LogEntry
+    /// (e.g., via `arena.dupe` or `std.json.Stringify.valueAlloc`), as the arena typically manages LogEntry
     /// lifetimes in MemTable, resetting on flush to free all memory.
-    pub fn init(arena: Allocator, message: []const u8, metadata_json: ?[]const u8) !LogEntry {
+    pub fn init(arena: Allocator, source_ts: u64, message: []const u8, metadata_json: ?[]const u8) !LogEntry {
+        // Why arena is used?
+        //
+        // For efficient memory management, this function implies the caller site passes duplicated message and
+        // metadata_json slices. Thus don't duplicate any more. The created entry is intended to be appended to
+        // `Memtable.entries` (which is managed by an arena). And Memtable' arena fully controlls the entries.
+        //
+        // Typically, Memtable frees memory of all entries on each flush cycle, efficiently. There is no need to
+        // duplicate anything before flushing.
+
         const ts_i64 = timestamp_fn();
         if (ts_i64 < 0) {
             // Handle pre-1970 timestamps
@@ -43,6 +54,7 @@ pub const LogEntry = struct {
 
         return LogEntry{
             .timestamp = ts_u64,
+            .source_ts = source_ts,
             .message = message,
             .metadata = metadata,
             .version = 1,
@@ -52,6 +64,8 @@ pub const LogEntry = struct {
     /// Serializes the LogEntry to JSON, using `allocator` for the returned slice.
     /// Call owns the returned memory.
     pub fn ser(self: *const LogEntry, allocator: Allocator) ![]u8 {
+        // Any allocator is fine, as the result of `ser` is usually used when written to a file or sent over the network.
+
         return try std.json.Stringify.valueAlloc(
             allocator,
             self,
@@ -67,6 +81,9 @@ pub const LogEntry = struct {
     /// as LogEntry stores references to its contents. Typically, `arena` is the
     /// MemTable's arena, which manages the lifecycle of deserialized entries.
     pub fn deser(arena: Allocator, serialized: []const u8) !LogEntry {
+        // Why is arena used?
+        // Deser is just another form of instantiation.
+
         return try std.json.parseFromSliceLeaky(
             LogEntry,
             arena,
@@ -76,6 +93,9 @@ pub const LogEntry = struct {
     }
 
     pub fn clone(self: *const LogEntry, arena: Allocator) !LogEntry {
+        // Why is arena used?
+        // Clone is just another form of instantiation.
+
         const owned_message = try arena.dupe(u8, self.message);
         errdefer arena.free(owned_message);
 
@@ -86,6 +106,7 @@ pub const LogEntry = struct {
 
         return LogEntry{
             .timestamp = self.timestamp,
+            .source_ts = self.source_ts,
             .message = owned_message,
             .metadata = owned_metadata,
             .version = self.version,
@@ -103,7 +124,7 @@ test "initInvalidTimestamp" {
     const borrowed_fn = timestamp_fn;
     timestamp_fn = mock_fn;
 
-    const result = LogEntry.init(testing.allocator, "test log", null);
+    const result = LogEntry.init(testing.allocator, 1762072995675, "test log", null);
     try testing.expectError(error.InvalidTimestamp, result);
 
     // Reset timestamp_fn
@@ -127,13 +148,13 @@ test "serWithoutMetadata" {
     const borrowed_fn = timestamp_fn;
     timestamp_fn = mock_fn;
 
-    const entry = try LogEntry.init(allocator, "test log", null);
+    const entry = try LogEntry.init(allocator, 1762072995675, "test log", null);
 
     const s = try entry.ser(t_allocator);
     defer t_allocator.free(s);
 
     try testing.expectEqualStrings(
-        "{\"timestamp\":123456789,\"message\":\"test log\",\"version\":1}",
+        "{\"timestamp\":123456789,\"source_ts\":1762072995675,\"message\":\"test log\",\"version\":1}",
         s,
     );
 
@@ -160,6 +181,7 @@ test "serWithMetadata" {
 
     const entry = try LogEntry.init(
         allocator,
+        1762072995675,
         "INFO | test log",
         "{\"level\": \"INFO\"}",
     );
@@ -168,7 +190,7 @@ test "serWithMetadata" {
     defer t_allocator.free(s);
 
     try testing.expectEqualStrings(
-        "{\"timestamp\":123456789,\"message\":\"INFO | test log\",\"metadata\":{\"level\":\"INFO\"},\"version\":1}",
+        "{\"timestamp\":123456789,\"source_ts\":1762072995675,\"message\":\"INFO | test log\",\"metadata\":{\"level\":\"INFO\"},\"version\":1}",
         s,
     );
 
@@ -182,10 +204,11 @@ test "deserWithoutMetadata" {
 
     const allocator = arena.allocator();
 
-    const entry_json = "{\"timestamp\":123456789,\"message\":\"INFO | test log\",\"version\":1}";
+    const entry_json = "{\"timestamp\":123456789,\"source_ts\":1762072995675,\"message\":\"INFO | test log\",\"version\":1}";
     const entry = try LogEntry.deser(allocator, entry_json);
 
     try testing.expectEqual(@as(u64, 123456789), entry.timestamp);
+    try testing.expectEqual(@as(u64, 1762072995675), entry.source_ts);
     try testing.expectEqualStrings("INFO | test log", entry.message);
     try testing.expectEqual(@as(?std.json.Value, null), entry.metadata);
     try testing.expectEqual(@as(u8, 1), entry.version);
@@ -197,10 +220,11 @@ test "deserWithNullMetadata" {
 
     const allocator = arena.allocator();
 
-    const entry_json = "{\"timestamp\":123456789,\"message\":\"INFO | test log\",\"metadata\":null,\"version\":1}";
+    const entry_json = "{\"timestamp\":123456789,\"source_ts\":1762072995675,\"message\":\"INFO | test log\",\"metadata\":null,\"version\":1}";
     const entry = try LogEntry.deser(allocator, entry_json);
 
     try testing.expectEqual(@as(u64, 123456789), entry.timestamp);
+    try testing.expectEqual(@as(u64, 1762072995675), entry.source_ts);
     try testing.expectEqualStrings("INFO | test log", entry.message);
     try testing.expectEqual(@as(?std.json.Value, null), entry.metadata);
     try testing.expectEqual(@as(u8, 1), entry.version);
@@ -212,10 +236,11 @@ test "deserWithMetadata" {
 
     const allocator = arena.allocator();
 
-    const entry_json = "{\"timestamp\":123456789,\"message\":\"INFO | test log\",\"metadata\":{\"level\":\"INFO\"},\"version\":1}";
+    const entry_json = "{\"timestamp\":123456789,\"source_ts\":1762072995675,\"message\":\"INFO | test log\",\"metadata\":{\"level\":\"INFO\"},\"version\":1}";
     const entry = try LogEntry.deser(allocator, entry_json);
 
     try testing.expectEqual(@as(u64, 123456789), entry.timestamp);
+    try testing.expectEqual(@as(u64, 1762072995675), entry.source_ts);
     try testing.expectEqualStrings("INFO | test log", entry.message);
 
     try testing.expect(entry.metadata != null);
@@ -238,14 +263,14 @@ test "deserFromFile" {
     const filename = "test_model_deserFromFile.tmp";
     try std.fs.cwd().writeFile(.{
         .sub_path = filename,
-        .data = "{\"timestamp\":123456789,\"message\":\"INFO | test log\",\"metadata\":{\"level\":\"INFO\"},\"version\":1}",
+        .data = "{\"timestamp\":123456789,\"source_ts\":1762072995675,\"message\":\"INFO | test log\",\"metadata\":{\"level\":\"INFO\"},\"version\":1}",
     });
 
     defer std.fs.cwd().deleteFile(filename) catch |err| {
         std.log.warn("Unable to cleanup the file: {s}, caused by: {}", .{ filename, err });
     };
 
-    const file_content = try std.fs.cwd().readFileAlloc(t_allocator, filename, 100);
+    const file_content = try std.fs.cwd().readFileAlloc(t_allocator, filename, 128);
     defer t_allocator.free(file_content);
 
     const entry = try LogEntry.deser(allocator, file_content);
@@ -272,7 +297,7 @@ test "deserInvalidJSON" {
 
     const allocator = arena.allocator();
 
-    const entry_json = "{\"timestamp\":123456789,\"message\":\"INFO | test log\",\"metadata\":{invalid},\"version\":1}";
+    const entry_json = "{\"timestamp\":123456789,\"source_ts\":1762072995675,\"message\":\"INFO | test log\",\"metadata\":{invalid},\"version\":1}";
     const result = LogEntry.deser(allocator, entry_json);
 
     try testing.expectError(error.SyntaxError, result);
@@ -284,7 +309,7 @@ test "cloneWithoutMetadata" {
 
     const allocator = arena.allocator();
 
-    const entry = try LogEntry.init(allocator, "test log", null);
+    const entry = try LogEntry.init(allocator, 1762072995675, "test log", null);
 
     const cloned = try entry.clone(allocator);
 
@@ -298,7 +323,7 @@ test "cloneWithMetadata" {
 
     const allocator = arena.allocator();
 
-    const entry = try LogEntry.init(allocator, "test log", "{\"level\":\"INFO\"}");
+    const entry = try LogEntry.init(allocator, 1762072995675, "test log", "{\"level\":\"INFO\"}");
 
     const cloned = try entry.clone(allocator);
 

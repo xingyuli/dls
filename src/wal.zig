@@ -33,6 +33,8 @@ pub const Wal = struct {
     }
 
     pub fn append(self: *Wal, allocator: Allocator, entry: *const LogEntry) !void {
+        // Any allocator is fine, it is used for serializing the entry.
+
         // Simulate failure if testing_fail_count > 0
         if (self.testing_fail_count > 0) {
             self.testing_fail_count -= 1;

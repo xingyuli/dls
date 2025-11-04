@@ -1,7 +1,8 @@
-@startuml iter5
+@startuml iter6
 
 class LogEntry {
   timestamp : u64
+  source_ts : u64
   message : []const u8
   metadata : ?std.json.Value
   version : u8
@@ -20,6 +21,7 @@ class MemTable {
   {field} entries : std.ArrayList(LogEntry)
   wal: Wal
   {field} sstable_files : std.ArrayList([]u8)
+  {field} compacted_files: std.ArrayList([]u8)
   config: Config
 
   + writeLog(self: *MemTable, entry: LogEntry) !void
@@ -28,12 +30,16 @@ class MemTable {
   - writeLogRecover(self: *MemTable, entry: LogEntry) !void
   - findInsertIndex(self: *const MemTable, timestamp: u64) usize
   - flush(self: *MemTable) !void
+  - compact(self: *MemTable) !void
+  - writeSstableFile(self: *MemTable, filename: []const u8, entries: []const LogEntry) !void
+  - scanSstableFile(result: *std.ArrayList(LogEntry), filename: []const u8, buffer: []u8, arena: Allocator, start_ts: u64, end_ts: u64) !void
 }
 
 class Config {
   max_log_entry_write_size: u32
   max_log_entry_recover_size: u32
   flush_threshold: u32
+  max_sstables_before_compact: usize
 }
 
 class Wal {
@@ -57,9 +63,17 @@ MemTable --> Wal
 
 note right of MemTable
   SSTable files
+
+  Level 0: recent flushes
   ---
   sst_0001.bin
   sst_0002.bin
+  ...
+
+  Level 1: compacted files
+  ---
+  sst_compacted_<ts1>.bin
+  sst_compacted_<ts2>.bin
   ...
 
   SSTable file
@@ -68,6 +82,8 @@ note right of MemTable
   line 2 ...
   line 3 ...
   ...
+
+
 end note
 
 class Server {

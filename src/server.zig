@@ -19,7 +19,9 @@ const ErrorCode = enum {
     unknown_action,
 
     // `write` request
+    missing_source_ts,
     missing_message,
+    invalid_source_ts,
     message_too_large,
 
     // `read` request
@@ -83,6 +85,10 @@ pub const Server = struct {
             };
         }
     }
+
+    // TODO future: self-explanatory protocol in JSON
+    //   supports user-friendly error messages based on protocol format
+    //   supports easily generated cli client
 
     // Messaging Protocol
     //
@@ -162,6 +168,16 @@ pub const Server = struct {
     }
 
     fn handleWriteRequest(self: *Server, conn: Connection, obj: std.json.ObjectMap) !void {
+        const source_ts = obj.get("source_ts") orelse {
+            try self.sendErr(conn, .missing_source_ts, .{});
+            return;
+        };
+
+        const source_ts_u64 = parseU64(source_ts) catch |err| {
+            try self.sendErr(conn, .invalid_source_ts, .{ .message = err });
+            return;
+        };
+
         const message = obj.get("message") orelse {
             try self.sendErr(conn, .missing_message, .{});
             return;
@@ -180,14 +196,13 @@ pub const Server = struct {
             return;
         }
 
-        // TODO future: source_ts
-
         const metadata = obj.get("metadata");
 
         const entry_arena = self.memtable.entry_allocator;
 
         const entry = try LogEntry.init(
             entry_arena,
+            source_ts_u64,
             try entry_arena.dupe(u8, message.string),
             if (metadata) |m| try std.json.Stringify.valueAlloc(entry_arena, m, .{}) else null,
         );
@@ -307,7 +322,7 @@ test "serverWriteAndRead" {
     var helper = SendRecvHelper{ .conn = conn, .allocator = a };
 
     // Test client: Write
-    const write_req = "{\"action\":\"write\",\"message\":\"test log\",\"metadata\":{\"level\":\"INFO\"}}\n";
+    const write_req = "{\"action\":\"write\",\"source_ts\":1762072995675,\"message\":\"test log\",\"metadata\":{\"level\":\"INFO\"}}\n";
     const write_resp = try helper.sendRecv(write_req);
     defer a.free(write_resp);
 

@@ -36,10 +36,11 @@ The server accepts TCP connections with JSON requests. Each request must end wit
 #### Write Request
 
 ```json
-{"action":"write","message":"log message","metadata":{"level":"INFO"}}
+{"action":"write","source_ts":1762248735671,"message":"log message","metadata":{"level":"INFO"}}
 ```
 
 - `action`: Must be `"write"`.
+- `source_ts`: Source side u64 timestamp (milliseconds).
 - `message`: String, max 1MB (configurable).
 - `metadata`: Optional JSON object (e.g., `{"level":"INFO"}`).
 - Response: `{"status":"ok"}` or `{"status":"error","errcode":"message_too_large","detail":{"max_size":1048576,"unit":"byte"}}`.
@@ -52,7 +53,7 @@ The server accepts TCP connections with JSON requests. Each request must end wit
 
 - `action`: Must be `"read"`.
 - `start_ts`, `end_ts`: u64 timestamps (milliseconds) for range query.
-- Response: `{"status":"ok","data":[{"timestamp":123456789,"message":"log message","metadata":{"level":"INFO"},"version":1}]}` or `{"status":"error","errcode":"invalid_start_ts","detail":{"message":"InvalidU64"}}`.
+- Response: `{"status":"ok","data":[{"timestamp":123456789,"source_ts":1762248735671,"message":"log message","metadata":{"level":"INFO"},"version":1}]}` or `{"status":"error","errcode":"invalid_start_ts","detail":{"message":"InvalidU64"}}`.
 
 #### Example Client (Python)
 
@@ -68,7 +69,7 @@ def send_request(host='127.0.0.1', port=5260, request=None):
         return json.loads(data)
 
 # Write a log
-write_req = {"action": "write", "message": "test log", "metadata": {"level": "INFO"}}
+write_req = {"action": "write", "source_ts": 1762248735671, "message": "test log", "metadata": {"level": "INFO"}}
 print(send_request(request=write_req))  # {"status": "ok"}
 
 # Read logs
@@ -84,13 +85,6 @@ print(send_request(request=read_req))  # {"status": "ok", "data": [...]}
   - `LogEntry.deser`: Input JSON must remain valid until `MemTable.flush`.
   - `MemTable.writeLog`: Entries must use `self.entries.allocator()` to align with flush-time reset.
 - **WAL**: Persists entries durably; not truncated post-flush to ensure crash recovery (to be addressed in Week 6).
-
-## Future Improvements
-
-- **Week 6**: Support client-provided timestamps with validation and metadata preservation.
-- **Week 7**: Add locking for multi-threaded replication.
-- **Week 8**: Implement sparse indexing for SSTables to improve read performance.
-- **Week 10**: Extend protocol for distributed routing.
 
 ## Testing
 

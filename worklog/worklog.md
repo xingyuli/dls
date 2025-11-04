@@ -108,7 +108,7 @@
 - Basic write and read operations: 2025.09.27
 - All the tasks: 2025.10.06
 
-# Extra Week: upgrade from 0.14.1 to 0.15.1
+# Week 5 Extra: upgrade from 0.14.1 to 0.15.1
 
 - ~~upgrade to 0.15.1~~
   - ~~use the new std.Io.Reader API~~
@@ -116,3 +116,20 @@
 - ~~re-run `writeManyLogs` test~~
 
 **Completed at**: 2025.10.15
+
+# Week 6: Compaction and Client Timestamps
+
+**Goals**: Implement compaction to merge SSTables and support client-provided timestamps without adjustment.
+
+**Tasks**:
+
+- ~~Update `LogEntry` to include `source_ts` for client-provided timestamp (saved as is) – 2 hours.~~
+- ~~Implement compaction to merge SSTables into a single file, preserving timestamp order – 3 hours.~~
+- ~~Update `MemTable.sstable_files` to reflect merged files and trigger compaction after flush if >4 SSTables – 2 hours.~~
+- Tests for compaction and ~~client timestamp handling~~ – 3 hours.
+
+**Deliverables**: Compaction implementation and client timestamp support with tests.
+
+**Dependencies/Notes**: Builds on Week 5. Data Storage section. Client timestamps saved in `source_ts` for latency metrics; no adjustments.
+
+**Completed at**: 2025.11.04

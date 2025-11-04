@@ -1,27 +1,28 @@
 # Informal Performance Test: writeManyLogs
 
 ## Quick Glance Summary
-| Version       | Scale | Write Latency | Read Latency |
-|---------------|-------|---------------|--------------|
+| Version         | Scale | Write Latency | Read Latency |
+|-----------------|-------|---------------|--------------|
+| V7 (Compaction) | 100K  | 266 µs        | 12.2 µs      |
 | V6 (Zig 0.15.1) | 100k  | 125 µs        | 12.1 µs      |
-| V5 (Arena)    | 100k  | 122 µs        | 29 µs        |
-| V4 (Flush)    | 100k  | 241 µs        | 188 µs       |
-| V3 (1KB Msg)  | 100k  | 178 µs        | 0.1 µs       |
-| V2 (WAL)      | 10k   | 115 µs        | 0.11 µs      |
-| V1 (Memory)   | 10k   | 58 µs         | 0.11 µs      |
+| V5 (Arena)      | 100k  | 122 µs        | 29 µs        |
+| V4 (Flush)      | 100k  | 241 µs        | 188 µs       |
+| V3 (1KB Msg)    | 100k  | 178 µs        | 0.1 µs       |
+| V2 (WAL)        | 10k   | 115 µs        | 0.11 µs      |
+| V1 (Memory)     | 10k   | 58 µs         | 0.11 µs      |
 
 ## Overview
 The `writeManyLogs` test in `memtable.zig` evaluates the performance of the Zig Log Store's write and read operations for a single-node LSM-Tree implementation. The test measures the time to write and read large numbers of log entries, with and without persistence and flushing, to assess the efficiency of memory management and storage mechanisms. V1 and V2 provide valuable baselines for single-threaded performance, representing the minimum achievable times for in-memory and WAL-persisted operations, respectively.
 
 ## Test Setup
-- **Test Name**: `writeManyLogs` (commented out in `memtable.zig`).
+- **Test Name**: `writeManyLogs`.
 - **Purpose**: Measure write and read latency for 10k and 100k log entries.
 - **Configuration**:
-  - `MemTable` with `flush_threshold=1,000` (V4–V6) or no flush (V1–V3).
+  - `MemTable` with `flush_threshold=1,000` (V4–V7) or no flush (V1–V3).
   - `max_log_entry_write_size=1MB`, `max_log_entry_recover_size=10MB`.
-  - Entries: `LogEntry` with `message` size ranging from small to ~1KB (V3–V6), optional `metadata` (JSON object), and server-generated timestamps (u64, milliseconds).
-  - WAL: Append-only with `fsync` for durability (V2–V6).
-  - SSTables: Binary format (`[u64 timestamp][u32 length][JSON entry]`), created during flush (V4–V6, ~100 SSTables for 100k entries).
+  - Entries: `LogEntry` with `message` size ranging from small to ~1KB (V3–V7), optional `metadata` (JSON object), and server-generated timestamps (u64, milliseconds).
+  - WAL: Append-only with `fsync` for durability (V2–V7).
+  - SSTables: Binary format (`[u64 timestamp][u32 length][JSON entry]`), created during flush (V4–V7, ~100 SSTables for 100k entries).
 - **Versions**:
   - **V1**: Pure in-memory `ArrayList` operations.
   - **V2**: V1 + WAL persistence.
@@ -29,14 +30,31 @@ The `writeManyLogs` test in `memtable.zig` evaluates the performance of the Zig 
   - **V4**: V3 + memtable flushing to SSTables (`flush_threshold=1,000`).
   - **V5**: V4 with arena-based memory management and optimized allocations.
   - **V6**: V5 with upgrade to Zig 0.15.1.
-- **Hardware Assumptions**: Standard development machine (e.g., 4-core CPU, SSD, 16GB RAM), Zig 0.15.1 for V6, Zig 0.14.1 for V1–V5, tested on 2025-10-15.
+  - **V7**: V6 + SSTable compaction (merge on threshold).
+- **Hardware Assumptions**: Standard development machine (e.g., 4-core CPU, SSD, 16GB RAM), Zig 0.15.1 for V6-V7, Zig 0.14.1 for V1–V5.
 - **Test Flow**:
-  - Write `N` entries using `MemTable.writeLog`, appending to WAL (V2–V6) and inserting into sorted memtable.
-  - Flush to SSTables every `flush_threshold=1,000` entries (V4–V6).
+  - Write `N` entries using `MemTable.writeLog`, appending to WAL (V2–V7) and inserting into sorted memtable.
+  - Flush to SSTables every `flush_threshold=1,000` entries (V4–V7).
   - Read all entries using `MemTable.readLogs` with a broad timestamp range (0 to max u64).
   - Measure total time, compute per-entry latency (µs), and calculate write:read ratio.
 
 ## Results
+
+### V7 (Week 6: SSTable Compaction)
+| Scale | Write Time | Write Latency | Read Time | Read Latency | Write:Read Ratio |
+|-------|------------|---------------|-----------|--------------|------------------|
+| 100k  | 26.61 s    | 266 µs        | 1.22 s    | 12.2 µs      | 21.72            |
+
+- **Observations**:
+  - Write latency: 266 µs → ~2.1x slower than V6 (~129 µs).
+    - Expected: Compaction runs in foreground during write path.
+    - ~100 flushes → ~25 compactions → each merges ~4 SSTables (sort + write).
+  - Read latency: 12.2 µs → identical to V6.
+    - ~75% fewer SSTables (~25 vs ~100) → but no speedup.
+    - Reason: `readLog()` still **scans every SSTable** → no indexing.
+  - Write:Read ratio: 21.72 → better than V6, exceeds 10:1–100:1 target.
+  - File count: ~25 SSTables vs ~100 → 75% reduction.
+
 ### V6 (Upgrade to Zig 0.15.1)
 | Scale | Write Time | Write Latency | Read Time | Read Latency | Write:Read Ratio |
 |-------|------------|---------------|-----------|--------------|------------------|
@@ -106,24 +124,25 @@ The `writeManyLogs` test in `memtable.zig` evaluates the performance of the Zig 
   - Reads are fast with in-memory scans.
 
 ## Analysis
-- **Arena-Based Memory Management (V5–V6)**:
-  - **Success**: V5 and V6 use arena allocators (`self.arena` in `MemTable`) with `flush_threshold=1,000`, bounding memory usage (~10–20 MB peak for 1,000 entries at 1KB each). `LogEntry` lifetimes align with the write-flush cycle, preventing leaks.
-  - **Zig 0.15.1 Impact (V6)**: Compared to V5 (~114–122 µs/write, ~29–30 µs/read), V6 writes are ~3–9% slower (~122–129 µs), but reads are ~2.4x faster (~12.0–12.4 µs), likely due to optimized `std.json` parsing or `std.fs` I/O in Zig 0.15.1.
+- **General Progression**:
+  - **Writes**: V1 (~58 µs) → V2 (~115 µs) → V3 (~138–178 µs) → V4 (~241–250 µs) → V5 (~114–122 µs) → V6 (~122–129 µs) → V7 (~266 µs). V7's 110% slowdown from V6 is due to foreground compaction overhead.
+  - **Reads**: V1–V3 (~0.11–0.12 µs) → V4 (~148–188 µs) → V5 (~29–30 µs) → V6 (~12.0–12.4 µs) → V7 (~12.2 µs). V7 stable despite fewer files.
+  - **Weakness**: Foreground compaction blocks writes; consider background threads (Week 7).
 
 - **Write Performance**:
-  - **Progression**: V1 (~58 µs, in-memory baseline) → V2 (~115 µs, WAL) → V3 (~138–178 µs, 1KB messages) → V4 (~241–250 µs, flush) → V5 (~114–122 µs, arena) → V6 (~122–129 µs). V6’s slight regression suggests allocator or I/O changes in Zig 0.15.1.
-  - **Weakness**: JSON serialization (`LogEntry.ser`) and WAL `fsync` remain costly, though arena mitigates this.
+  - **Progression**: V1 (~58 µs, in-memory baseline) → V2 (~115 µs, WAL) → V3 (~138–178 µs, 1KB messages) → V4 (~241–250 µs, flush) → V5 (~114–122 µs, arena) → V6 (~122–129 µs) → V7 (~266 µs). V7's slowdown is due to compaction.
+  - **Weakness**: JSON serialization (`LogEntry.ser`) and WAL `fsync` remain costly, though arena mitigates this. Compaction adds sort/write overhead.
 
 - **Read Performance**:
-  - **Progression**: V1–V3 (~0.11–0.12 µs, in-memory baseline) → V4 (~148–188 µs, ~100 SSTables) → V5 (~29–30 µs) → V6 (~12.0–12.4 µs). V6’s ~2.4x improvement over V5 suggests Zig 0.15.1 optimizations (e.g., faster JSON parsing).
+  - **Progression**: V1–V3 (~0.11–0.12 µs, in-memory baseline) → V4 (~148–188 µs, ~100 SSTables) → V5 (~29–30 µs) → V6 (~12.0–12.4 µs) → V7 (~12.2 µs). V7’s ~2.4x improvement over V5 suggests Zig 0.15.1 optimizations (e.g., faster JSON parsing).
   - **Baseline**: V1’s ~0.11 µs/read is the single-threaded minimum, unachievable with persistence.
   - **Weakness**: Sequential SSTable access remains a bottleneck (1.2–1.24 s for 100k), requiring sparse indexing.
 
 - **Write:Read Ratio**:
-  - V1 (~500:1) → V2 (~1,000:1) → V3 (~1,300–1,600:1) → V4 (~1.28–1.70:1) → V5 (~3.83–4.26:1) → V6 (~10.23–10.47). V6 hits the 10:1–100:1 target, driven by faster reads.
+  - V1 (~500:1) → V2 (~1,000:1) → V3 (~1,300–1,600:1) → V4 (~1.28–1.70:1) → V5 (~3.83–4.26:1) → V6 (~10.23–10.47) → V7 (~21.72). V7 hits the 10:1–100:1 target, driven by faster reads.
 
-- **V6 Optimizations**:
-  - Inherits V5’s arena. Zig 0.15.1 boosts reads (~2.4x), likely via improved `std.json` or `std.fs`. Write regression (~3–9%) needs profiling to identify allocator or I/O changes.
+- **V7 Optimizations**:
+  - Tiered compaction reduces file count (~25 vs ~100). Write slowdown (~110%) due to foreground merges; consider background compaction. Read stable, ready for indexing.
 
 ## Next Steps
 - **Read Optimization (Week 8)**:
@@ -131,7 +150,7 @@ The `writeManyLogs` test in `memtable.zig` evaluates the performance of the Zig 
   - Temporary hack: Limit scanned SSTables (e.g., last 10) for recent logs.
 
 - **Write Optimization (Week 6)**:
-  - Batch WAL appends (e.g., write 10 entries, then `fsync`) to target <100 µs/write, addressing V6’s ~3–9% regression.
+  - Batch WAL appends (e.g., write 10 entries, then `fsync`) to target <100 µs/write, addressing V7’s compaction overhead.
   - Explore binary metadata format (e.g., CBOR, as discussed previously) to reduce `LogEntry.ser/deser` overhead.
 
 - **WAL Management (Week 6)**:
@@ -143,6 +162,6 @@ The `writeManyLogs` test in `memtable.zig` evaluates the performance of the Zig 
   - Test specific timestamp ranges (e.g., last 1,000 entries) to assess read performance for typical queries.
 
 ## Conclusion
-The `writeManyLogs` test shows progress, with V6 (Zig 0.15.1) achieving ~122–129 µs/write and ~12.0–12.4 µs/read at 100k entries, a ~2x write and ~15x read improvement over V4. Compared to V5 (~114–122 µs/write, ~29–30 µs/read), V6 writes are ~3–9% slower, but reads are ~2.4x faster, likely due to Zig 0.15.1 optimizations. V1 (~58 µs/write, ~0.11 µs/read at 10k) and V2 (~115 µs/write, ~0.11 µs/read at 10k) provide single-threaded baselines. V6’s ~10:1 write:read ratio meets the target, but read performance (1.2–1.24 s) requires sparse indexing (Week 8). These results guide Week 6 optimizations (timestamp support, WAL checkpointing).
+The `writeManyLogs` test shows progress, with V7 achieving ~266 µs/write and ~12.2 µs/read at 100k entries, a 110% write slowdown from V6 but with 75% fewer files. Compared to V6 (~122–129 µs/write, ~12.0–12.4 µs/read), V7's reads are stable, and the ratio improves to 21.72. V1 (~58 µs/write, ~0.11 µs/read at 10k) and V2 (~115 µs/write, ~0.11 µs/read at 10k) provide single-threaded baselines. V7’s ~21.72:1 write:read ratio meets the target, but read performance (1.23 s) requires sparse indexing (Week 8). These results guide Week 6 optimizations (timestamp support, WAL checkpointing).
 
-**Tested on**: 2025-10-15
+**Tested on**: November 04, 2025

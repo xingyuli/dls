@@ -200,7 +200,7 @@ pub const MemTable = struct {
         );
         errdefer self.gpa.free(filename);
 
-        try self.writeSstableTable(filename, self.entries.items);
+        try self.writeSstableFile(filename, self.entries.items);
 
         // Track SSTable file
         try self.sstable_files.append(self.gpa, filename);
@@ -286,7 +286,7 @@ pub const MemTable = struct {
         const merged_filename = try std.fmt.allocPrint(self.gpa, "sst_compacted_{d}.bin", .{std.time.milliTimestamp()});
         errdefer self.gpa.free(merged_filename);
 
-        try self.writeSstableTable(merged_filename, merged_entries.items);
+        try self.writeSstableFile(merged_filename, merged_entries.items);
 
         // 3. Add to L1
         try self.compacted_files.append(self.gpa, merged_filename);
@@ -352,7 +352,7 @@ pub const MemTable = struct {
     }
 
     /// Write entries in binary format: [timestamp: u64][length: u32][serialized_entry] .
-    fn writeSstableTable(self: *const MemTable, filename: []const u8, entries: []const LogEntry) !void {
+    fn writeSstableFile(self: *const MemTable, filename: []const u8, entries: []const LogEntry) !void {
         const f = try std.fs.cwd().createFile(filename, .{});
         defer f.close();
 
@@ -509,8 +509,8 @@ test "writeAndReadLog" {
     defer mt.deinit();
     defer cleanupTestWalFile(wal_filename);
 
-    const entry1 = try LogEntry.init(mt.entry_allocator, 1762072995675, "test log 1", null);
-    const entry2 = try LogEntry.init(mt.entry_allocator, 1762072995676, "test log 2", null);
+    const entry1 = try createTestLogEntry(mt.entry_allocator, "test log 1");
+    const entry2 = try createTestLogEntry(mt.entry_allocator, "test log 2");
     try mt.writeLog(entry1);
     try mt.writeLog(entry2);
 
@@ -534,7 +534,7 @@ test "readEmptyTimeRange" {
     defer mt.deinit();
     defer cleanupTestWalFile(wal_filename);
 
-    try mt.writeLog(try LogEntry.init(mt.entry_allocator, 1762072995675, "test log", null));
+    try mt.writeLog(try createTestLogEntry(mt.entry_allocator, "test log"));
 
     var arena = ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -552,7 +552,7 @@ test "readInvalidTimeRange" {
     defer mt.deinit();
     defer cleanupTestWalFile(wal_filename);
 
-    try mt.writeLog(try LogEntry.init(mt.entry_allocator, 1762072995675, "test log", null));
+    try mt.writeLog(try createTestLogEntry(mt.entry_allocator, "test log"));
 
     var arena = ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -571,17 +571,17 @@ test "flushAndReadSSTable" {
     defer cleanupTestWalFile(wal_filename);
     defer cleanupSstableFiles(mt.sstable_files.items);
 
-    const entry1 = try LogEntry.init(mt.entry_allocator, 1762072995675, "test log 1", null);
+    const entry1 = try createTestLogEntry(mt.entry_allocator, "test log 1");
     try mt.writeLog(entry1);
 
     // guarantee the sort order by delaying 10 ms
     std.Thread.sleep(std.time.ns_per_ms * 10);
-    const entry2 = try LogEntry.init(mt.entry_allocator, 1762072995675, "test log 2", null);
+    const entry2 = try createTestLogEntry(mt.entry_allocator, "test log 2");
     try mt.writeLog(entry2); // triggers flush
 
     // guarantee the sort order by delaying 10 ms
     std.Thread.sleep(std.time.ns_per_ms * 10);
-    const entry3 = try LogEntry.init(mt.entry_allocator, 1762072995675, "test log 3", null);
+    const entry3 = try createTestLogEntry(mt.entry_allocator, "test log 3");
     try mt.writeLog(entry3);
 
     try testing.expectEqual(@as(usize, 1), mt.entries.items.len);
@@ -637,7 +637,7 @@ test "writeManyLogs" {
     for (0..entry_count) |i| {
         const message = try std.fmt.allocPrint(allocator, "INFO | test log {d} {s}", .{ i, msg_1k });
 
-        try mt.writeLog(try LogEntry.init(allocator, 1762072995675, message, "{\"level\":\"INFO\"}"));
+        try mt.writeLog(try createTestLogEntryWithMetadata(allocator, message, "{\"level\":\"INFO\"}"));
     }
     const write_time_ns = timer.read() - write_start_ns;
 
@@ -677,7 +677,7 @@ test "writeLogRetryFailure" {
     mt.wal.setTestingFailCount(4);
 
     // Expect failure and no entries change
-    const entry = try LogEntry.init(mt.entry_allocator, 1762072995675, "test log", null);
+    const entry = try createTestLogEntry(mt.entry_allocator, "test log");
     try testing.expectError(MemTableError.DiskFull, mt.writeLog(entry));
     try testing.expectEqual(@as(usize, 0), mt.entries.items.len);
 
@@ -705,7 +705,7 @@ test "writeOversizedLog" {
     defer mt.deinit();
     defer cleanupTestWalFile(wal_filename);
 
-    const entry = try LogEntry.init(mt.entry_allocator, 1762072995675, "1234567890a", null);
+    const entry = try createTestLogEntry(mt.entry_allocator, "1234567890a");
 
     try testing.expectError(MemTableError.LogEntryTooLarge, mt.writeLog(entry));
     try testing.expectEqual(@as(usize, 0), mt.entries.items.len);
@@ -726,9 +726,8 @@ test "recoverSuccess" {
         var wal = try Wal.init(wal_filename);
         defer wal.deinit();
 
-        const entry = try LogEntry.init(
+        const entry = try createTestLogEntryWithMetadata(
             allocator,
-            1762072995675,
             "INFO | test log",
             "{\"level\":\"INFO\"}",
         );
@@ -767,7 +766,7 @@ test "recoverOversizedLog" {
 
         var message: [100]u8 = undefined;
         @memset(&message, 'x');
-        const entry = try LogEntry.init(allocator, 1762072995675, &message, null);
+        const entry = try createTestLogEntry(allocator, &message);
 
         try wal.append(allocator, &entry);
     }
@@ -799,7 +798,7 @@ test "recoverCorruptedLog" {
         const allocator = arena.allocator();
 
         // Valid entry
-        const entry = try LogEntry.init(allocator, 1762072995675, "test log", null);
+        const entry = try createTestLogEntry(allocator, "test log");
         try wal.append(allocator, &entry);
 
         // Corrupted entry (wrong CRC)
@@ -834,7 +833,7 @@ test "recoverMalformedLog" {
         const allocator = arena.allocator();
 
         // Valid entry
-        const entry = try LogEntry.init(allocator, 1762072995675, "test log", null);
+        const entry = try createTestLogEntry(allocator, "test log");
         try wal.append(allocator, &entry);
 
         // Malformed entry
@@ -851,6 +850,184 @@ test "recoverMalformedLog" {
 
     try testing.expectEqual(@as(usize, 1), mt.entries.items.len);
     try testing.expectEqualStrings("test log", mt.entries.items[0].message);
+}
+
+test "compaction merge correctness and sort order" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(gpa.deinit() == .ok);
+
+    const allocator = gpa.allocator();
+
+    const wal_filename = "test_memtable_compaction.wal";
+    defer cleanupTestWalFile(wal_filename);
+
+    var mt = try MemTable.init(allocator, wal_filename, .{ .max_sstables_before_compact = 2 });
+    defer mt.deinit();
+
+    // Create mock entries
+    const entries1 = [_]LogEntry{
+        try createTestLogEntryWithTs(mt.entry_allocator, "msg1", 1000),
+        try createTestLogEntryWithTs(mt.entry_allocator, "msg3", 3000),
+    };
+    const entries2 = [_]LogEntry{
+        try createTestLogEntryWithTs(mt.entry_allocator, "msg2", 2000),
+        try createTestLogEntryWithTs(mt.entry_allocator, "msg2.5", 2500), // Overlap
+    };
+
+    // Write mock SSTables
+    const sst1 = "sst_test1.bin";
+    const sst2 = "sst_test2.bin";
+    try writeMockSstable(allocator, sst1, &entries1);
+    try writeMockSstable(allocator, sst2, &entries2);
+    defer std.fs.cwd().deleteFile(sst1) catch {};
+    defer std.fs.cwd().deleteFile(sst2) catch {};
+
+    // Mock sstable_files
+    try mt.sstable_files.append(allocator, try allocator.dupe(u8, sst1));
+    try mt.sstable_files.append(allocator, try allocator.dupe(u8, sst2));
+
+    // Run compact
+    try mt.compact();
+
+    // Verify: L0 empty, L1 has 1 new file
+    try testing.expectEqual(@as(usize, 0), mt.sstable_files.items.len);
+    try testing.expectEqual(@as(usize, 1), mt.compacted_files.items.len);
+    const new_sst = mt.compacted_files.items[0];
+
+    var arena = ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    // Read new SST, check merged/sorted
+    const read_entries = try readSstable(arena.allocator(), new_sst, 256);
+    try testing.expectEqual(@as(usize, 4), read_entries.items.len);
+    try testing.expectEqual(1000, read_entries.items[0].timestamp);
+    try testing.expectEqualStrings("msg1", read_entries.items[0].message);
+    try testing.expectEqual(2000, read_entries.items[1].timestamp);
+    try testing.expectEqual(2500, read_entries.items[2].timestamp);
+    try testing.expectEqual(3000, read_entries.items[3].timestamp);
+
+    // Cleanup new file
+    std.fs.cwd().deleteFile(new_sst) catch {};
+}
+
+test "end-to-end compaction under load" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(gpa.deinit() == .ok);
+
+    const allocator = gpa.allocator();
+
+    const wal_filename = "test_memtable_compaction_e2e.wal";
+    defer cleanupTestWalFile(wal_filename);
+
+    var mt = try MemTable.init(
+        allocator,
+        wal_filename,
+        .{ .flush_threshold = 5, .max_sstables_before_compact = 3 },
+    );
+    defer mt.deinit();
+
+    const num_entries = 20; // 4 flushes (>=3 L0 triggers compact)
+    for (0..num_entries) |i| {
+        const ts = 1000 + i; // Increasing for sort
+        try mt.writeLog(try createTestLogEntryWithTs(
+            mt.entry_allocator,
+            try std.fmt.allocPrint(mt.entry_allocator, "msg{d}", .{i}),
+            ts,
+        ));
+    }
+
+    // Verify compaction happened
+    try testing.expectEqual(@as(usize, 1), mt.sstable_files.items.len);
+    try testing.expectEqual(@as(usize, 1), mt.compacted_files.items.len);
+
+    var arena = ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    // Read all, verify count/sort
+    const read_logs = try mt.readLog(arena.allocator(), 0, std.math.maxInt(u64));
+    try testing.expectEqual(@as(usize, 20), read_logs.len);
+    for (1..read_logs.len) |j| {
+        try testing.expectEqual(1000 + (j - 1), read_logs[j - 1].timestamp);
+        try testing.expect(read_logs[j - 1].timestamp <= read_logs[j].timestamp);
+    }
+
+    cleanupSstableFiles(mt.sstable_files.items);
+    cleanupSstableFiles(mt.compacted_files.items);
+}
+
+fn createTestLogEntry(allocator: Allocator, message: []const u8) !LogEntry {
+    return LogEntry.init(
+        allocator,
+        1762072995675,
+        message,
+        null, // no metadata for simplicity
+    );
+}
+
+fn createTestLogEntryWithTs(allocator: Allocator, message: []const u8, timestamp: u64) !LogEntry {
+    var result = try LogEntry.init(
+        allocator,
+        1762072995675,
+        message,
+        null, // no metadata for simplicity
+    );
+    result.timestamp = timestamp;
+    return result;
+}
+
+fn createTestLogEntryWithMetadata(allocator: Allocator, message: []const u8, metadata: []const u8) !LogEntry {
+    return LogEntry.init(
+        allocator,
+        1762072995675,
+        message,
+        metadata,
+    );
+}
+
+fn writeMockSstable(allocator: Allocator, filename: []const u8, entries: []const LogEntry) !void {
+    const f = try std.fs.cwd().createFile(filename, .{});
+    defer f.close();
+
+    for (entries) |e| {
+        try f.writeAll(&std.mem.toBytes(e.timestamp));
+
+        const serialized = try e.ser(allocator);
+        defer allocator.free(serialized);
+        try f.writeAll(&std.mem.toBytes(@as(u32, @intCast(serialized.len))));
+
+        try f.writeAll(serialized);
+    }
+    try f.sync();
+}
+
+fn readSstable(arena: Allocator, filename: []const u8, comptime buffer_size: u32) !std.ArrayList(LogEntry) {
+    const f = try std.fs.cwd().openFile(filename, .{});
+    defer f.close();
+
+    var buffer: [buffer_size]u8 = undefined;
+    var file_reader = f.reader(&buffer);
+    const reader = &file_reader.interface;
+
+    var entries = std.ArrayList(LogEntry).empty;
+    errdefer entries.deinit(arena);
+
+    while (true) {
+        // timestamp
+        _ = reader.takeInt(u64, .little) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+
+        const len = try reader.takeInt(u32, .little);
+
+        const serialized = try arena.alloc(u8, len);
+        try reader.readSliceAll(serialized);
+
+        const entry = try LogEntry.deser(arena, serialized);
+        try entries.append(arena, entry);
+    }
+
+    return entries;
 }
 
 fn cleanupTestWalFile(filename: []const u8) void {

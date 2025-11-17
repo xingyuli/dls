@@ -33,6 +33,7 @@ const MemTableError = error{
     FileSystemError,
 };
 
+// TODO sstable filenames are lost when server restarts
 pub const MemTable = struct {
     gpa: Allocator,
 
@@ -47,6 +48,13 @@ pub const MemTable = struct {
     // Track SSTable filenames, with tiered compaction
     sstable_files: std.ArrayList([]u8), // Level 0: recent flushes
     compacted_files: std.ArrayList([]u8), // Level 1: merged
+
+    const CheckpointEntry = LogEntry{
+        .timestamp = 0,
+        .source_ts = 0,
+        .message = "MARKER:CHECKPOINT",
+        .version = 1,
+    };
 
     /// Initializes a MemTable and recovers log entries from the specified WAL file.
     /// The caller owns the returned MemTable, deinitialize with `deinit`.
@@ -213,6 +221,9 @@ pub const MemTable = struct {
         // Clear memtable
         self.entries.clearAndFree(self.entry_allocator);
         _ = self.arena.reset(.free_all);
+
+        // Append checkpoint to WAL
+        try self.wal.append(self.gpa, &CheckpointEntry);
 
         // TODO future: clear content of wal once WAL-append and flush-to-SSTable is atomic
         //   This pattern is common in durable systems (e.g., Kafka logs checkpoint offsets)—it's why WALs often persist
@@ -481,6 +492,14 @@ pub const MemTable = struct {
 
                     continue;
                 };
+
+                if (std.mem.eql(u8, entry.message, CheckpointEntry.message) and entry.timestamp == CheckpointEntry.timestamp) {
+                    // Checkpoint found: Clear memtable (prior entries are in SSTables)
+                    self.entries.clearAndFree(self.entry_allocator);
+                    _ = self.arena.reset(.free_all);
+                    continue; // Continue to replay post-checkpoint entries
+                }
+
                 // Use recovery-specific writeLog
                 try self.writeLogRecover(entry);
             } else |err| switch (err) {
@@ -850,6 +869,41 @@ test "recoverMalformedLog" {
 
     try testing.expectEqual(@as(usize, 1), mt.entries.items.len);
     try testing.expectEqualStrings("test log", mt.entries.items[0].message);
+}
+
+test "recovery with checkpoint avoids duplicates" {
+    const t_allocator = testing.allocator;
+    const wal_filename = "test_memtable_recovery_with_checkpoint.wal";
+
+    // Setup Memtable with low threshold
+    var mt = try MemTable.init(t_allocator, wal_filename, .{ .flush_threshold = 2 });
+
+    // flush (adds checkpoint)
+    try mt.writeLog(try createTestLogEntry(mt.entry_allocator, "entry1"));
+    std.Thread.sleep(std.time.ns_per_ms * 10);
+    try mt.writeLog(try createTestLogEntry(mt.entry_allocator, "entry2"));
+
+    // post-checkpoint
+    std.Thread.sleep(std.time.ns_per_ms * 10);
+    try mt.writeLog(try createTestLogEntry(mt.entry_allocator, "entry3"));
+
+    // One SSTable created, prepare an additional sstable_files for cleanup, as `deinit` will free them.
+    try testing.expectEqual(@as(usize, 1), mt.sstable_files.items.len);
+    const sstable_file = try t_allocator.dupe(u8, mt.sstable_files.items[0]);
+    defer t_allocator.free(sstable_file);
+    var sstable_files = [_][]u8{sstable_file};
+
+    // Simulate crash/recovery: Deinit and re-init
+    mt.deinit();
+    mt = try MemTable.init(t_allocator, wal_filename, .{ .flush_threshold = 2 });
+    defer mt.deinit();
+
+    // Verify: Only entry3 in memtable (entry1 and entry2 are in SST, not duplicated)
+    try testing.expectEqual(@as(usize, 1), mt.entries.items.len);
+    try testing.expectEqualStrings("entry3", mt.entries.items[0].message);
+
+    cleanupTestWalFile(wal_filename);
+    cleanupSstableFiles(&sstable_files);
 }
 
 test "compaction merge correctness and sort order" {

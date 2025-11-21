@@ -38,14 +38,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const wal_mod = b.createModule(.{
-        .root_source_file = b.path("src/wal.zig"),
+    const server_mod = b.createModule(.{
+        .root_source_file = b.path("src/server.zig"),
         .target = target,
         .optimize = optimize,
     });
-
-    // Add dependency: main.zig depends on model.zig
-    exe_mod.addImport("model", model_mod);
 
     // This creates another `std.Build.Step.Compile`, but this one builds an executable
     // rather than a static library.
@@ -82,36 +79,33 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
-    const exe_unit_tests = b.addTest(.{
-        .root_module = exe_mod,
-    });
+    // test setup
 
+    const exe_unit_tests = b.addTest(.{ .root_module = exe_mod });
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 
-    // Similar to creating the run step earlier, this exposes a `test` step to
-    // the `zig build --help` menu, providing a way for the user to request
-    // running the unit tests.
+    const model_unit_tests = b.addTest(.{ .root_module = model_mod });
+    const run_model_unit_tests = b.addRunArtifact(model_unit_tests);
+
+    const memtable_unit_tests = b.addTest(.{ .root_module = memtable_mod });
+    const run_memtable_unit_tests = b.addRunArtifact(memtable_unit_tests);
+
+    const server_unit_tests = b.addTest(.{ .root_module = server_mod });
+    const run_server_unit_tests = b.addRunArtifact(server_unit_tests);
+
+    // Main test step that runs ALL tests
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_unit_tests.step);
-
-    // Test step for model.zig
-    const model_unit_tests = b.addTest(.{
-        .root_module = model_mod,
-    });
-    const run_model_unit_tests = b.addRunArtifact(model_unit_tests);
     test_step.dependOn(&run_model_unit_tests.step);
-
-    // Test step for memtable.zig
-    const memtable_unit_tests = b.addTest(.{
-        .root_module = memtable_mod,
-    });
-    const run_memtable_unit_tests = b.addRunArtifact(memtable_unit_tests);
     test_step.dependOn(&run_memtable_unit_tests.step);
+    test_step.dependOn(&run_server_unit_tests.step);
 
-    // Test step for wal.zig
-    const wal_unit_tests = b.addTest(.{
-        .root_module = wal_mod,
-    });
-    const run_wal_unit_tests = b.addRunArtifact(wal_unit_tests);
-    test_step.dependOn(&run_wal_unit_tests.step);
+    const test_model_step = b.step("test-model", "Run model tests");
+    test_model_step.dependOn(&run_model_unit_tests.step);
+
+    const test_memtable_step = b.step("test-memtable", "Run memtable tests");
+    test_memtable_step.dependOn(&run_memtable_unit_tests.step);
+
+    const test_server_step = b.step("test-server", "Run server tests");
+    test_server_step.dependOn(&run_server_unit_tests.step);
 }

@@ -269,19 +269,19 @@ pub const MemTable = struct {
                     },
                 };
 
-                const serialized = try arena.alloc(u8, len);
-                errdefer arena.free(serialized);
+                const encoded = try arena.alloc(u8, len);
+                errdefer arena.free(encoded);
 
-                reader.readSliceAll(serialized) catch {
+                reader.readSliceAll(encoded) catch {
                     std.log.warn("Corrupted SSTable {s}: failed to read entry", .{filename});
 
                     // Must be freed by manual as `errdefer` will not be executed
-                    arena.free(serialized);
+                    arena.free(encoded);
 
                     break;
                 };
 
-                const entry = try LogEntry.deser(arena, serialized);
+                const entry = try LogEntry.decodeCbor(arena, encoded);
                 try merged_entries.append(arena, entry);
             }
         }
@@ -371,11 +371,11 @@ pub const MemTable = struct {
             try f.writeAll(&std.mem.toBytes(entry.timestamp));
 
             // `self.gpa` is used for accurate memory control.
-            const serialized = try entry.ser(self.gpa);
-            defer self.gpa.free(serialized);
-            try f.writeAll(&std.mem.toBytes(@as(u32, @intCast(serialized.len))));
+            const encoded = try entry.encodeCbor(self.gpa);
+            defer self.gpa.free(encoded);
+            try f.writeAll(&std.mem.toBytes(@as(u32, @intCast(encoded.len))));
 
-            try f.writeAll(serialized);
+            try f.writeAll(encoded);
         }
         try f.sync();
     }
@@ -413,14 +413,14 @@ pub const MemTable = struct {
             };
 
             // Read serialized entry
-            const serialized = try arena.alloc(u8, len);
-            errdefer arena.free(serialized);
+            const encoded = try arena.alloc(u8, len);
+            errdefer arena.free(encoded);
 
-            reader.readSliceAll(serialized) catch {
+            reader.readSliceAll(encoded) catch {
                 std.log.warn("Corrupted SSTable {s}: incomplete entry", .{filename});
 
                 // Must be freed by manual as `errdefer` will not be executed
-                arena.free(serialized);
+                arena.free(encoded);
                 break;
             };
 
@@ -428,7 +428,7 @@ pub const MemTable = struct {
             if (timestamp < start_ts or timestamp > end_ts) continue;
 
             // Deserialize and add to result
-            const entry = try LogEntry.deser(arena, serialized);
+            const entry = try LogEntry.decodeCbor(arena, encoded);
             try result.append(arena, entry);
         }
     }
@@ -445,77 +445,69 @@ pub const MemTable = struct {
         const reader = &file_reader.interface;
 
         while (true) {
-            if (reader.peekDelimiterExclusive('\n')) |_| {
-                // Read CRC32 (u32)
-                const expected_crc = reader.takeInt(u32, .little) catch |err| switch (err) {
-                    error.EndOfStream => break,
-                    error.ReadFailed => {
-                        std.log.warn("Corrupted WAL: incomplete CRC32 at offset {}", .{try f.getPos()});
-                        break;
-                    },
-                };
-
-                const json_line = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
-                    error.StreamTooLong => {
-                        // TODO future: report recover discard via metrics
-                        std.log.warn(
-                            "Discarding oversized log entry when recover (max: {d})",
-                            .{buffer.len},
-                        );
-
-                        // skip rest bytes of this long line
-                        _ = reader.discardDelimiterInclusive('\n') catch unreachable;
-
-                        continue;
-                    },
-                    error.EndOfStream, error.ReadFailed => return err,
-                };
-
-                // Verify CRC32
-                const actual_crc = std.hash.Crc32.hash(json_line);
-                if (actual_crc != expected_crc) {
-                    std.log.warn("Corrupted WAL entry: CRC32 mismatch (expected: {x:8}, actual: {x:8})", .{ expected_crc, actual_crc });
-                    continue;
-                }
-
-                const owned_json_line = try self.entry_allocator.dupe(u8, json_line);
-                errdefer self.entry_allocator.free(owned_json_line);
-
-                const entry = LogEntry.deser(self.entry_allocator, owned_json_line) catch |err| {
-                    // There might be some memory leak, but it's okay as `MemTable.arena` will be reset in each
-                    // writeLog-flush cycle.
-
-                    std.log.warn("Skipping invalid log entry during recovery: {s}, caused by: {}", .{ json_line, err });
-
-                    // Must be freed by manual as `errdefer` will not be executed
-                    self.entry_allocator.free(owned_json_line);
-
-                    continue;
-                };
-
-                if (std.mem.eql(u8, entry.message, CheckpointEntry.message) and entry.timestamp == CheckpointEntry.timestamp) {
-                    // Checkpoint found: Clear memtable (prior entries are in SSTables)
-                    self.entries.clearAndFree(self.entry_allocator);
-                    _ = self.arena.reset(.free_all);
-                    continue; // Continue to replay post-checkpoint entries
-                }
-
-                // Use recovery-specific writeLog
-                try self.writeLogRecover(entry);
-            } else |err| switch (err) {
+            // Read CRC32 (u32)
+            const expected_crc = reader.takeInt(u32, .little) catch |err| switch (err) {
                 error.EndOfStream => break,
-                error.StreamTooLong => {
-                    // TODO future: report recover discard via metrics
-                    std.log.warn(
-                        "Discarding oversized log entry when recover (max: {d})",
-                        .{buffer.len},
-                    );
-
-                    // skip rest bytes of this long line
-                    _ = reader.discardDelimiterInclusive('\n') catch unreachable;
+                error.ReadFailed => {
+                    std.log.warn("Corrupted WAL: incomplete CRC32 at offset {}", .{try f.getPos()});
+                    break;
                 },
-                error.ReadFailed => return err,
+            };
+
+            // Read Length (u32)
+            const len = reader.takeInt(u32, .little) catch |err| {
+                std.log.warn("Corrupted WAL: incomplete len at offset {}", .{try f.getPos()});
+                return err;
+            };
+
+            if (len > self.config.max_log_entry_recover_size) {
+                try reader.discardAll(len);
+
+                // TODO future: report recover discard via metrics
+                std.log.warn(
+                    "Discarding oversized log entry when recover (size: {d}, max: {d})",
+                    .{ len, self.config.max_log_entry_recover_size },
+                );
+
+                continue;
             }
+
+            const encoded = try self.entry_allocator.alloc(u8, len);
+            errdefer self.entry_allocator.free(encoded);
+
+            reader.readSliceAll(encoded) catch |err| {
+                std.log.warn("Corrupted WAL: incomplete entry at offset {}", .{try f.getPos()});
+
+                // Must be freed by manual as `errdefer` will not be executed
+                self.entry_allocator.free(encoded);
+
+                return err;
+            };
+
+            // Verify CRC32
+            const actual_crc = std.hash.Crc32.hash(encoded);
+            if (actual_crc != expected_crc) {
+                std.log.warn("Corrupted WAL entry: CRC32 mismatch (expected: {x:8}, actual: {x:8})", .{ expected_crc, actual_crc });
+                continue;
+            }
+
+            const entry = LogEntry.decodeCbor(self.entry_allocator, encoded) catch |err| {
+                // There might be some memory leak, but it's okay as `MemTable.arena` will be reset in each
+                // writeLog-flush cycle.
+
+                std.log.warn("Skipping invalid log entry during recovery, caused by: {}", .{err});
+
+                continue;
+            };
+
+            if (std.mem.eql(u8, entry.message, CheckpointEntry.message) and entry.timestamp == CheckpointEntry.timestamp) {
+                // Checkpoint found: Clear memtable (prior entries are in SSTables)
+                self.entries.clearAndFree(self.entry_allocator);
+                _ = self.arena.reset(.free_all);
+                continue; // Continue to replay post-checkpoint entries
+            }
+
+            try self.writeLogRecover(entry);
         }
     }
 };
@@ -823,8 +815,10 @@ test "recoverCorruptedLog" {
         // Corrupted entry (wrong CRC)
         const bad_crc = std.mem.toBytes(@as(u32, 0xDEADBEEF));
         try wal.f.writeAll(&bad_crc);
-        try wal.f.writeAll("{\"timestamp\":1234567890,\"message\":\"bad\"}");
-        try wal.f.writeAll("\n");
+
+        const msg = "{\"timestamp\":1234567890,\"message\":\"bad\"}";
+        try wal.f.writeAll(&std.mem.toBytes(@as(u32, @intCast(msg.len))));
+        try wal.f.writeAll(msg);
         try wal.f.sync();
     }
 
@@ -859,8 +853,8 @@ test "recoverMalformedLog" {
         const malformed_json = "{\"timestamp\":1234567890,\"message\":,}";
         const crc = std.hash.Crc32.hash(malformed_json);
         try wal.f.writeAll(&std.mem.toBytes(crc));
+        try wal.f.writeAll(&std.mem.toBytes(@as(u32, @intCast(malformed_json.len))));
         try wal.f.writeAll(malformed_json);
-        try wal.f.writeAll("\n");
         try wal.f.sync();
     }
 
@@ -1045,11 +1039,11 @@ fn writeMockSstable(allocator: Allocator, filename: []const u8, entries: []const
     for (entries) |e| {
         try f.writeAll(&std.mem.toBytes(e.timestamp));
 
-        const serialized = try e.ser(allocator);
-        defer allocator.free(serialized);
-        try f.writeAll(&std.mem.toBytes(@as(u32, @intCast(serialized.len))));
+        const encoded = try e.encodeCbor(allocator);
+        defer allocator.free(encoded);
+        try f.writeAll(&std.mem.toBytes(@as(u32, @intCast(encoded.len))));
 
-        try f.writeAll(serialized);
+        try f.writeAll(encoded);
     }
     try f.sync();
 }
@@ -1074,10 +1068,10 @@ fn readSstable(arena: Allocator, filename: []const u8, comptime buffer_size: u32
 
         const len = try reader.takeInt(u32, .little);
 
-        const serialized = try arena.alloc(u8, len);
-        try reader.readSliceAll(serialized);
+        const encoded = try arena.alloc(u8, len);
+        try reader.readSliceAll(encoded);
 
-        const entry = try LogEntry.deser(arena, serialized);
+        const entry = try LogEntry.decodeCbor(arena, encoded);
         try entries.append(arena, entry);
     }
 

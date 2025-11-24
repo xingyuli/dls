@@ -1,0 +1,100 @@
+@startuml iter6
+
+class LogEntry {
+  timestamp : u64
+  source_ts : u64
+  message : []const u8
+  metadata : ?std.json.Value
+  version : u8
+
+  + serJson(self: *const LogEntry, a: Allocator) ![]u8
+  + deserJson(arena: Allocator, serialized: []const u8) !LogEntry
+  + encodeCbor(self: *const LogEntry, a: Allocator) ![]u8
+  + decodeCbor(arena: Allocator, serialized: []const u8) !LogEntry
+  + clone(self: *const LogEntry, arena: Allocator) !LogEntry
+}
+
+note right of LogEntry::timestamp
+  milli ts
+end note
+
+class MemTable {
+  arena: *ArenaAllocator
+  {field} entries : std.ArrayList(LogEntry)
+  wal: Wal
+  {field} sstable_files : std.ArrayList([]u8)
+  {field} compacted_files: std.ArrayList([]u8)
+  config: Config
+
+  + writeLog(self: *MemTable, entry: LogEntry) !void
+  + readLog(self: *const MemTable, arena: Allocator, start_ts: u64, end_ts: u64) ![]const LogEntry
+  - recover(self: *MemTable, wal_filename: []const u8) !void
+  - writeLogRecover(self: *MemTable, entry: LogEntry) !void
+  - findInsertIndex(self: *const MemTable, timestamp: u64) usize
+  - flush(self: *MemTable) !void
+  - compact(self: *MemTable) !void
+  - writeSstableFile(self: *MemTable, filename: []const u8, entries: []const LogEntry) !void
+  - scanSstableFile(result: *std.ArrayList(LogEntry), filename: []const u8, buffer: []u8, arena: Allocator, start_ts: u64, end_ts: u64) !void
+}
+
+class Config {
+  max_log_entry_write_size: u32
+  max_log_entry_recover_size: u32
+  flush_threshold: u32
+  max_sstables_before_compact: usize
+}
+
+class Wal {
+  f: std.fs.File
+
+  + append(self: *Wal, a: Allocator, entry: *const LogEntry) !void
+}
+
+note right of Wal
+  Wal file
+  ---
+  [CRC32:u32][Length:u32][LogEntry.encodeCbor]+
+end note
+
+MemTable *- LogEntry
+MemTable --> Config
+MemTable --> Wal
+
+note right of MemTable
+  SSTable files
+
+  Level 0: recent flushes
+  ---
+  sst_0001.bin
+  sst_0002.bin
+  ...
+
+  Level 1: compacted files
+  ---
+  sst_compacted_<ts1>.bin
+  sst_compacted_<ts2>.bin
+  ...
+
+  SSTable file
+  ---
+  [Timestamp:u64][Length:u32][LogEntry.encodeCbor]+
+  ...
+
+
+end note
+
+class Server {
+  allocator: Allocator
+  memtable: *MemTable
+  {field} should_stop: std.atomic.Value(bool)
+
+  + serve(self: *Server) !void
+  + stop(self: *Server) void
+  - handleConnection(self: *Server, conn: Connection) !void
+  - handleWriteRequest(self: *Server, conn: Connection, obj: std.json.ObjectMap) !void
+  - handleReadRequest(self: *Server, conn: Connection, obj: std.json.ObjectMap) !void
+}
+
+Server --> MemTable
+
+@enduml

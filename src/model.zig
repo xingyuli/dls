@@ -2,6 +2,7 @@
 // Licensed under the MIT License
 
 const std = @import("std");
+const zbor = @import("zbor");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
@@ -62,9 +63,11 @@ pub const LogEntry = struct {
     }
 
     /// Serializes the LogEntry to JSON, using `allocator` for the returned slice.
-    /// Call owns the returned memory.
-    pub fn ser(self: *const LogEntry, allocator: Allocator) ![]u8 {
-        // Any allocator is fine, as the result of `ser` is usually used when written to a file or sent over the network.
+    ///
+    /// Caller owns the returned memory.
+    pub fn serJson(self: *const LogEntry, allocator: Allocator) ![]u8 {
+        // Any allocator is fine, as the result of `serJson` is usually used when written to a file or sent over the
+        // network.
 
         return try std.json.Stringify.valueAlloc(
             allocator,
@@ -77,12 +80,13 @@ pub const LogEntry = struct {
     }
 
     /// Deserializes a JSON string into a LogEntry, using `arena` for allocations.
+    ///
     /// The `serialized` slice must remain valid until the next `MemTable.flush`,
     /// as LogEntry stores references to its contents. Typically, `arena` is the
     /// MemTable's arena, which manages the lifecycle of deserialized entries.
-    pub fn deser(arena: Allocator, serialized: []const u8) !LogEntry {
+    pub fn deserJson(arena: Allocator, serialized: []const u8) !LogEntry {
         // Why is arena used?
-        // Deser is just another form of instantiation.
+        // `deserJson` is just another form of instantiation.
 
         return try std.json.parseFromSliceLeaky(
             LogEntry,
@@ -90,6 +94,80 @@ pub const LogEntry = struct {
             serialized,
             .{},
         );
+    }
+
+    /// Serializes the LogEntry to CBOR format, using `allocator` for the returned slice.
+    /// Metadata is currently serialized as a JSON string within the CBOR map.
+    ///
+    /// Caller owns the returned memory.
+    pub fn encodeCbor(self: *const @This(), allocator: Allocator) ![]u8 {
+        var b = try zbor.Builder.withType(allocator, .Map);
+
+        try b.pushTextString("timestamp");
+        try b.pushInt(@intCast(self.timestamp));
+
+        try b.pushTextString("source_ts");
+        try b.pushInt(@intCast(self.source_ts));
+
+        try b.pushTextString("message");
+        try b.pushByteString(self.message);
+
+        if (self.metadata) |m| {
+            const m_json = try std.json.Stringify.valueAlloc(allocator, m, .{});
+            defer allocator.free(m_json);
+
+            try b.pushTextString("metadata");
+            try b.pushByteString(m_json);
+        }
+
+        try b.pushTextString("version");
+        try b.pushInt(self.version);
+
+        return try b.finish();
+    }
+
+    /// Deserializes a CBOR-encoded slice into a LogEntry, using `arena` for allocations.
+    ///
+    /// The `encoded` slice must remain valid until the next `MemTable.flush`,
+    /// as LogEntry stores references to its contents. Typically, `arena` is the
+    /// MemTable's arena, which manages the lifecycle of deserialized entries.
+    pub fn decodeCbor(arena: Allocator, encoded: []const u8) !@This() {
+        var timestamp: ?u64 = null;
+        var source_ts: ?u64 = null;
+        var message: ?[]const u8 = null;
+        var metadata: ?std.json.Value = null;
+        var version: ?u8 = null;
+
+        const di = try zbor.DataItem.new(encoded);
+        var map_iter = di.map() orelse return error.ExpectedMap;
+        while (map_iter.next()) |pair| {
+            const key = pair.key.string() orelse continue;
+
+            if (std.mem.eql(u8, key, "timestamp")) {
+                const val = pair.value.int() orelse return error.InvalidTimestamp;
+                timestamp = @intCast(val);
+            } else if (std.mem.eql(u8, key, "source_ts")) {
+                const val = pair.value.int() orelse return error.InvalidSourceTs;
+                source_ts = @intCast(val);
+            } else if (std.mem.eql(u8, key, "message")) {
+                message = pair.value.string() orelse return error.InvalidMessage;
+            } else if (std.mem.eql(u8, key, "metadata")) {
+                const val = pair.value.string() orelse return error.InvalidMetadata;
+                // TODO CBOR recursively ?
+                metadata = try std.json.parseFromSliceLeaky(std.json.Value, arena, val, .{});
+            } else if (std.mem.eql(u8, key, "version")) {
+                const val = pair.value.int() orelse return error.InvalidVersion;
+                version = @intCast(val);
+            }
+        }
+
+        return LogEntry{
+            .timestamp = timestamp orelse return error.MissingTimestamp,
+            .source_ts = source_ts orelse return error.MissingSourceTs,
+            .message = message orelse return error.MissingMessage,
+            .metadata = metadata,
+            .version = version orelse return error.MissingVersion,
+        };
     }
 
     pub fn clone(self: *const LogEntry, arena: Allocator) !LogEntry {
@@ -150,7 +228,7 @@ test "serWithoutMetadata" {
 
     const entry = try LogEntry.init(allocator, 1762072995675, "test log", null);
 
-    const s = try entry.ser(t_allocator);
+    const s = try entry.serJson(t_allocator);
     defer t_allocator.free(s);
 
     try testing.expectEqualStrings(
@@ -186,7 +264,7 @@ test "serWithMetadata" {
         "{\"level\": \"INFO\"}",
     );
 
-    const s = try entry.ser(t_allocator);
+    const s = try entry.serJson(t_allocator);
     defer t_allocator.free(s);
 
     try testing.expectEqualStrings(
@@ -205,7 +283,7 @@ test "deserWithoutMetadata" {
     const allocator = arena.allocator();
 
     const entry_json = "{\"timestamp\":123456789,\"source_ts\":1762072995675,\"message\":\"INFO | test log\",\"version\":1}";
-    const entry = try LogEntry.deser(allocator, entry_json);
+    const entry = try LogEntry.deserJson(allocator, entry_json);
 
     try testing.expectEqual(@as(u64, 123456789), entry.timestamp);
     try testing.expectEqual(@as(u64, 1762072995675), entry.source_ts);
@@ -221,7 +299,7 @@ test "deserWithNullMetadata" {
     const allocator = arena.allocator();
 
     const entry_json = "{\"timestamp\":123456789,\"source_ts\":1762072995675,\"message\":\"INFO | test log\",\"metadata\":null,\"version\":1}";
-    const entry = try LogEntry.deser(allocator, entry_json);
+    const entry = try LogEntry.deserJson(allocator, entry_json);
 
     try testing.expectEqual(@as(u64, 123456789), entry.timestamp);
     try testing.expectEqual(@as(u64, 1762072995675), entry.source_ts);
@@ -237,7 +315,7 @@ test "deserWithMetadata" {
     const allocator = arena.allocator();
 
     const entry_json = "{\"timestamp\":123456789,\"source_ts\":1762072995675,\"message\":\"INFO | test log\",\"metadata\":{\"level\":\"INFO\"},\"version\":1}";
-    const entry = try LogEntry.deser(allocator, entry_json);
+    const entry = try LogEntry.deserJson(allocator, entry_json);
 
     try testing.expectEqual(@as(u64, 123456789), entry.timestamp);
     try testing.expectEqual(@as(u64, 1762072995675), entry.source_ts);
@@ -273,7 +351,7 @@ test "deserFromFile" {
     const file_content = try std.fs.cwd().readFileAlloc(t_allocator, filename, 128);
     defer t_allocator.free(file_content);
 
-    const entry = try LogEntry.deser(allocator, file_content);
+    const entry = try LogEntry.deserJson(allocator, file_content);
 
     try testing.expectEqualStrings("INFO | test log", entry.message);
     try testing.expectEqualStrings("INFO", entry.metadata.?.object.get("level").?.string);
@@ -286,7 +364,7 @@ test "deserMissingRequiredFields" {
     const allocator = arena.allocator();
 
     const entry_json = "{\"version\":1}";
-    const result = LogEntry.deser(allocator, entry_json);
+    const result = LogEntry.deserJson(allocator, entry_json);
 
     try testing.expectError(std.json.ParseFromValueError.MissingField, result);
 }
@@ -298,7 +376,7 @@ test "deserInvalidJSON" {
     const allocator = arena.allocator();
 
     const entry_json = "{\"timestamp\":123456789,\"source_ts\":1762072995675,\"message\":\"INFO | test log\",\"metadata\":{invalid},\"version\":1}";
-    const result = LogEntry.deser(allocator, entry_json);
+    const result = LogEntry.deserJson(allocator, entry_json);
 
     try testing.expectError(error.SyntaxError, result);
 }
@@ -334,3 +412,37 @@ test "cloneWithMetadata" {
         try testing.expectEqualStrings("INFO", m.object.get("level").?.string);
     }
 }
+
+test "cbor encode and decode" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // without metadata
+    {
+        const entry = try LogEntry.init(arena.allocator(), 1762072995675, "test log", null);
+
+        const encoded = try entry.encodeCbor(testing.allocator);
+        defer testing.allocator.free(encoded);
+
+        const decoded = try LogEntry.decodeCbor(arena.allocator(), encoded);
+
+        try std.testing.expectEqual(1762072995675, decoded.source_ts);
+        try std.testing.expectEqualStrings("test log", decoded.message);
+        try std.testing.expectEqual(@as(u8, 1), decoded.version);
+    }
+
+    // with metadata
+    {
+        const entry = try LogEntry.init(arena.allocator(), 1762072995675, "test log", "{\"level\":\"INFO\"}");
+
+        const encoded = try entry.encodeCbor(testing.allocator);
+        defer testing.allocator.free(encoded);
+
+        const decoded = try LogEntry.decodeCbor(arena.allocator(), encoded);
+
+        try std.testing.expect(decoded.metadata != null);
+        try std.testing.expectEqualStrings("INFO", decoded.metadata.?.object.get("level").?.string);
+    }
+}
+
+// TODO add edge cases for cbor

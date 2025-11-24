@@ -41,18 +41,17 @@ pub const Wal = struct {
             return error.DiskFull;
         }
 
-        const s = try entry.ser(allocator);
-        defer allocator.free(s);
+        const encoded = try entry.encodeCbor(allocator);
+        defer allocator.free(encoded);
 
         // TODO future `f.writeAll` is deprecated but new std.Io.Writer API is inconvenient
 
-        const crc = std.hash.Crc32.hash(s);
+        const crc = std.hash.Crc32.hash(encoded);
         try self.f.writeAll(&std.mem.toBytes(crc));
 
-        try self.f.writeAll(s);
+        try self.f.writeAll(&std.mem.toBytes(@as(u32, @intCast(encoded.len))));
 
-        // CRITICAL: new line is a must
-        try self.f.writeAll("\n");
+        try self.f.writeAll(encoded);
 
         // wait for underlying fs completion
         try self.f.sync();

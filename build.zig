@@ -1,8 +1,5 @@
 const std = @import("std");
 
-// Although this function looks imperative, note that its job is to
-// declaratively construct a build graph that will be executed by an external
-// runner.
 pub fn build(b: *std.Build) void {
     // Standard target options allows the person running `zig build` to choose
     // what target to build for. Here we do not override the defaults, which
@@ -15,46 +12,27 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
-    // We will also create a module for our other entry point, 'main.zig'.
-    const exe_mod = b.createModule(.{
-        // `root_source_file` is the Zig "entry point" of the module. If a module
-        // only contains e.g. external object files, you can make this `null`.
-        // In this case the main source file is merely a path, however, in more
-        // complicated build scripts, this could be a generated file.
+    const main_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    const model_mod = b.createModule(.{
-        .root_source_file = b.path("src/model.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const memtable_mod = b.createModule(.{
-        .root_source_file = b.path("src/memtable.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const server_mod = b.createModule(.{
-        .root_source_file = b.path("src/server.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // This creates another `std.Build.Step.Compile`, but this one builds an executable
-    // rather than a static library.
     const exe = b.addExecutable(.{
         .name = "dls",
-        .root_module = exe_mod,
+        .root_module = main_mod,
     });
 
-    // This declares intent for the executable to be installed into the
-    // standard location when the user invokes the "install" step (the default
-    // step when running `zig build`).
     b.installArtifact(exe);
+
+    // external dependencies
+    const zbor_dep = b.dependency("zbor", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zbor_mod = zbor_dep.module("zbor");
+
+    exe.root_module.addImport("zbor", zbor_mod);
 
     // This *creates* a Run step in the build graph, to be executed when another
     // step is evaluated that depends on it. The next line below will establish
@@ -79,10 +57,39 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
-    // test setup
+    setupTest(b, target, optimize, main_mod, zbor_mod);
+}
 
-    const exe_unit_tests = b.addTest(.{ .root_module = exe_mod });
-    const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
+fn setupTest(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    main_mod: *std.Build.Module,
+    zbor_mod: *std.Build.Module,
+) void {
+    const model_mod = b.createModule(.{
+        .root_source_file = b.path("src/model.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    model_mod.addImport("zbor", zbor_mod);
+
+    const memtable_mod = b.createModule(.{
+        .root_source_file = b.path("src/memtable.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    memtable_mod.addImport("zbor", zbor_mod);
+
+    const server_mod = b.createModule(.{
+        .root_source_file = b.path("src/server.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_mod.addImport("zbor", zbor_mod);
+
+    const main_unit_tests = b.addTest(.{ .root_module = main_mod });
+    const run_main_unit_tests = b.addRunArtifact(main_unit_tests);
 
     const model_unit_tests = b.addTest(.{ .root_module = model_mod });
     const run_model_unit_tests = b.addRunArtifact(model_unit_tests);
@@ -95,7 +102,7 @@ pub fn build(b: *std.Build) void {
 
     // Main test step that runs ALL tests
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_exe_unit_tests.step);
+    test_step.dependOn(&run_main_unit_tests.step);
     test_step.dependOn(&run_model_unit_tests.step);
     test_step.dependOn(&run_memtable_unit_tests.step);
     test_step.dependOn(&run_server_unit_tests.step);

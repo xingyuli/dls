@@ -133,3 +133,37 @@
 **Dependencies/Notes**: Builds on Week 5. Data Storage section. Client timestamps saved in `source_ts` for latency metrics; no adjustments.
 
 **Completed at**: 2025.11.04
+
+# Week 6 Extra: Compaction Testing and WAL Checkpointing
+
+**Goals**: Validate SSTable compaction with tests and implement WAL checkpointing for improved recovery and truncation.
+
+**Tasks**:
+
+- ~~Develop unit tests for SSTable compaction, including merge correctness, sort order preservation, and file cleanup – 3 hours.~~
+- ~~Implement end-to-end tests for compaction under load (e.g., simulate multiple flushes and verify reduced file count) – 2 hours.~~
+- ~~Add WAL checkpoint mechanism: Write checkpoints after successful flushes using a marker (e.g., "CHECKPOINT") – 2 hours.~~
+- ~~Integrate checkpointing into recovery logic to skip pre-checkpoint entries~~ and enable WAL truncation – 2 hours.
+- ~~Tests for WAL checkpointing, including crash simulation and verification of no duplicates post-recovery – 1 hour.~~
+
+**Deliverables**: Comprehensive compaction tests and WAL checkpointing with integration and tests.
+
+**Dependencies/Notes**: Builds on Week 6. Practice Zig's file I/O (`std.fs`) and testing framework. Inspired by RocksDB's WAL management for durability without duplicates. Total time: ~10 hours.
+
+**Completed at**: 2025.11.12
+
+# Week 7: Switch to CBOR Protocol
+
+**Goals**: Replace JSON protocol with CBOR for more efficient serialization and deserialization.
+
+**Tasks**:
+
+- ~~Research and integrate CBOR support using `std.cbor` or a suitable library (e.g., zbor) – 3 hours.~~
+- ~~Use CBOR instead of JSON when file persistent in WAL and sstable – 4 hours.~~
+- ~~Tests for CBOR protocol, including serialization correctness and compatibility – 3 hours.~~
+
+**Deliverables**: CBOR-based protocol implementation with tests.
+
+**Dependencies/Notes**: Builds on Week 5's TCP/JSON setup. Use zbor for efficiency. Reduces overhead for binary data.
+
+**Completed at**: 2025.11.24

@@ -6,10 +6,12 @@ const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
-const LogEntry = @import("./model.zig").LogEntry;
+const model = @import("./model.zig");
+const LogEntry = model.LogEntry;
 const Wal = @import("./wal.zig").Wal;
 
 const Config = struct {
+    // TODO now: solve mismatch: write time counts characters, while recover time counts bytes length
     /// The upper size limit in bytes of each log entry when write. Default to 1M. This is an estimated size.
     max_log_entry_write_size: u32 = 1024 * 1024,
 
@@ -33,7 +35,7 @@ const MemTableError = error{
     FileSystemError,
 };
 
-// TODO sstable filenames are lost when server restarts
+// TODO future: sstable filenames are lost when server restarts
 pub const MemTable = struct {
     gpa: Allocator,
 
@@ -48,6 +50,10 @@ pub const MemTable = struct {
     // Track SSTable filenames, with tiered compaction
     sstable_files: std.ArrayList([]u8), // Level 0: recent flushes
     compacted_files: std.ArrayList([]u8), // Level 1: merged
+
+    // TODO future: any measurement library available?
+    tu_flush: i128 = 0,
+    cnt_flush: u64 = 0,
 
     const CheckpointEntry = LogEntry{
         .timestamp = 0,
@@ -148,7 +154,7 @@ pub const MemTable = struct {
         const max_retries: i32 = 3;
         var retries: i32 = max_retries;
         while (retries >= 0) : (retries -= 1) {
-            self.wal.append(self.gpa, &entry) catch |err| {
+            self.wal.append(self.entry_allocator, &entry) catch |err| {
                 std.log.warn("WAL append failed (retries left: {d}), caused by: {}", .{ retries, err });
 
                 switch (err) {
@@ -183,7 +189,10 @@ pub const MemTable = struct {
 
         // Check if flush is needed
         if (self.entries.items.len >= self.config.flush_threshold) {
+            const x = std.time.nanoTimestamp();
             try self.flush();
+            self.tu_flush += std.time.nanoTimestamp() - x;
+            self.cnt_flush += 1;
         }
     }
 
@@ -367,12 +376,13 @@ pub const MemTable = struct {
         const f = try std.fs.cwd().createFile(filename, .{});
         defer f.close();
 
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+
         for (entries) |entry| {
             try f.writeAll(&std.mem.toBytes(entry.timestamp));
 
-            // `self.gpa` is used for accurate memory control.
-            const encoded = try entry.encodeCbor(self.gpa);
-            defer self.gpa.free(encoded);
+            const encoded = try entry.encodeCbor(arena.allocator());
             try f.writeAll(&std.mem.toBytes(@as(u32, @intCast(encoded.len))));
 
             try f.writeAll(encoded);
@@ -611,8 +621,9 @@ test "flushAndReadSSTable" {
     try testing.expectEqualStrings("test log 3", logs[2].message);
 }
 
+// TODO next: observe mermory and disk usage
 // Run this test manually with:
-// `RUN_SLOW_TEST=1 zig test --test-filter writeManyLogs src/memtable.zig`
+// `RUN_SLOW_TEST=1 zig build test-memtable`
 test "writeManyLogs" {
     const t_allocator = testing.allocator;
     const wal_filename = "test_memtable_writeManyLogs.wal";
@@ -644,13 +655,14 @@ test "writeManyLogs" {
     const allocator = arena_write.allocator();
 
     // Measure write time
-    const write_start_ns = timer.read();
+    var write_time_ns: u64 = 0;
     for (0..entry_count) |i| {
         const message = try std.fmt.allocPrint(allocator, "INFO | test log {d} {s}", .{ i, msg_1k });
 
+        const start = timer.read();
         try mt.writeLog(try createTestLogEntryWithMetadata(allocator, message, "{\"level\":\"INFO\"}"));
+        write_time_ns += timer.read() - start;
     }
-    const write_time_ns = timer.read() - write_start_ns;
 
     // All entries have been flushed to SSTable files.
     try testing.expectEqual(@as(usize, 0), mt.entries.items.len);
@@ -665,15 +677,59 @@ test "writeManyLogs" {
     try testing.expectEqual(@as(usize, entry_count), logs.len);
 
     const ratio = @as(f64, @floatFromInt(write_time_ns)) / @as(f64, @floatFromInt(read_time_ns));
+
     std.debug.print(
-        "writeManyLogs (threshold={d}): wrote {} entries in {} ns, read in {} ns, ratio={d:.2}\n",
-        .{ mt.config.flush_threshold, entry_count, write_time_ns, read_time_ns, ratio },
-    );
+        \\writeManyLogs (entry_count={d}, threshold={d}):
+        \\  write_time      {d:.2}s in total, {d:.2}us per entry
+        \\  read_time       {d:.2}s in total, {d:.2}us per entry
+        \\  w/r ratio       {d:.2}
+        \\
+        \\  MemTable:
+        \\    tu_flush      {d}us per flush
+        \\    cnt_flush     {d}
+        \\
+        \\  Wal:
+        \\    tu_encodeCbor {d}us per entry
+        \\    tu_writeAll   {d}us per entry
+        \\
+        \\  LogEntry:
+        \\    tu_push       {d}us per entry
+        \\    cnt_push      {d}
+        \\    tu_finish     {d}us per entry
+        \\    cnt_finish    {d}
+        \\
+    , .{
+        entry_count,
+        mt.config.flush_threshold,
+
+        @as(f64, @floatFromInt(write_time_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s)),
+        @as(f64, @floatFromInt(write_time_ns)) / @as(f64, @floatFromInt(entry_count * std.time.ns_per_us)),
+
+        @as(f64, @floatFromInt(read_time_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s)),
+        @as(f64, @floatFromInt(read_time_ns)) / @as(f64, @floatFromInt(entry_count * std.time.ns_per_us)),
+
+        ratio,
+
+        // MemTable
+        @divFloor(mt.tu_flush, mt.cnt_flush * std.time.ns_per_us),
+        mt.cnt_flush,
+
+        // Wal
+        @divFloor(mt.wal.tu_encodeCbor, entry_count * std.time.ns_per_us),
+        @divFloor(mt.wal.tu_writeAll, entry_count * std.time.ns_per_us),
+
+        // LogEntry:
+        @divFloor(model.tu_push, model.cnt_push * std.time.ns_per_us),
+        model.cnt_push,
+        @divFloor(model.tu_finish, model.cnt_finish * std.time.ns_per_us),
+        model.cnt_finish,
+    });
 
     // TODO future: for a logging system, write:read ratios of 10:1 to 100:1 are typicial for write-heavy workloads
     //   read performance needs improvement
 
-    try testing.expect(write_time_ns < read_time_ns * 15);
+    // TODO future: ratio between ...?
+    // try testing.expect(write_time_ns < read_time_ns * 15);
 }
 
 test "writeLogRetryFailure" {

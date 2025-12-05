@@ -13,6 +13,10 @@ pub const Wal = struct {
     /// Testing-only: simulate append failures
     testing_fail_count: i32 = 0,
 
+    // TODO future: any measurement library available?
+    tu_encodeCbor: i128 = 0,
+    tu_writeAll: i128 = 0,
+
     pub fn init(filename: []const u8) !Wal {
         const f = std.fs.cwd().openFile(
             filename,
@@ -41,18 +45,23 @@ pub const Wal = struct {
             return error.DiskFull;
         }
 
+        const x = std.time.nanoTimestamp();
         const encoded = try entry.encodeCbor(allocator);
         defer allocator.free(encoded);
+        self.tu_encodeCbor += std.time.nanoTimestamp() - x;
 
-        // TODO future `f.writeAll` is deprecated but new std.Io.Writer API is inconvenient
+        // TODO future: `f.writeAll` is deprecated but new std.Io.Writer API is inconvenient
 
+        const y = std.time.nanoTimestamp();
         const crc = std.hash.Crc32.hash(encoded);
         try self.f.writeAll(&std.mem.toBytes(crc));
 
         try self.f.writeAll(&std.mem.toBytes(@as(u32, @intCast(encoded.len))));
 
         try self.f.writeAll(encoded);
+        self.tu_writeAll += std.time.nanoTimestamp() - y;
 
+        // TODO future: fsync in batch (see chat conversation: Optimizing WAL Performance and Durability)
         // wait for underlying fs completion
         try self.f.sync();
     }

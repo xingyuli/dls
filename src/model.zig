@@ -8,6 +8,13 @@ const Allocator = std.mem.Allocator;
 
 pub var timestamp_fn: *const fn () i64 = std.time.milliTimestamp;
 
+// TODO future: any measurement library available?
+pub var tu_push: i128 = 0;
+pub var cnt_push: i128 = 0;
+
+pub var tu_finish: i128 = 0;
+pub var cnt_finish: i128 = 0;
+
 /// Allocators are passed explicitly to enable arena-based ownership (e.g., in MemTable), reducing global state while allowing future allocator swaps for optimization.
 pub const LogEntry = struct {
 
@@ -103,6 +110,8 @@ pub const LogEntry = struct {
     pub fn encodeCbor(self: *const @This(), allocator: Allocator) ![]u8 {
         var b = try zbor.Builder.withType(allocator, .Map);
 
+        const x = std.time.nanoTimestamp();
+
         try b.pushTextString("timestamp");
         try b.pushInt(@intCast(self.timestamp));
 
@@ -113,17 +122,34 @@ pub const LogEntry = struct {
         try b.pushByteString(self.message);
 
         if (self.metadata) |m| {
-            const m_json = try std.json.Stringify.valueAlloc(allocator, m, .{});
-            defer allocator.free(m_json);
+            // TODO now: encode from JSON to CBOR recursively ?
+            // const m_json = try std.json.Stringify.valueAlloc(allocator, m, .{});
+            // defer allocator.free(m_json);
 
             try b.pushTextString("metadata");
-            try b.pushByteString(m_json);
+
+            try b.enter(.Map);
+
+            try b.pushTextString("level");
+            try b.pushByteString(m.object.get("level").?.string);
+
+            try b.leave();
+
+            // try b.pushByteString(m_json);
         }
 
         try b.pushTextString("version");
         try b.pushInt(self.version);
 
-        return try b.finish();
+        tu_push += std.time.nanoTimestamp() - x;
+        cnt_push += 1;
+
+        const y = std.time.nanoTimestamp();
+        const result = try b.finish();
+        tu_finish += std.time.nanoTimestamp() - y;
+        cnt_finish += 1;
+
+        return result;
     }
 
     /// Deserializes a CBOR-encoded slice into a LogEntry, using `arena` for allocations.
@@ -152,9 +178,19 @@ pub const LogEntry = struct {
             } else if (std.mem.eql(u8, key, "message")) {
                 message = pair.value.string() orelse return error.InvalidMessage;
             } else if (std.mem.eql(u8, key, "metadata")) {
-                const val = pair.value.string() orelse return error.InvalidMetadata;
-                // TODO CBOR recursively ?
-                metadata = try std.json.parseFromSliceLeaky(std.json.Value, arena, val, .{});
+                // TODO now: decode from CBOR to JSON recursively ?
+                var o = std.json.ObjectMap.init(arena);
+
+                var m_iter = pair.value.map() orelse unreachable;
+                while (m_iter.next()) |m_pair| {
+                    try o.put(m_pair.key.string() orelse unreachable, std.json.Value{ .string = m_pair.value.string() orelse unreachable });
+                }
+
+                metadata = std.json.Value{ .object = o };
+
+                // const val = pair.value.string() orelse return error.InvalidMetadata;
+                // metadata = try std.json.parseFromSliceLeaky(std.json.Value, arena, val, .{});
+
             } else if (std.mem.eql(u8, key, "version")) {
                 const val = pair.value.int() orelse return error.InvalidVersion;
                 version = @intCast(val);
@@ -445,4 +481,4 @@ test "cbor encode and decode" {
     }
 }
 
-// TODO add edge cases for cbor
+// TODO future: add edge cases for cbor

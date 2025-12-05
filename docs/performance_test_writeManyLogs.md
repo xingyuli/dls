@@ -1,16 +1,17 @@
 # Informal Performance Test: writeManyLogs
 
 ## Quick Glance Summary
-| Version           | Scale | Write Latency | Read Latency |
-|-------------------|-------|---------------|--------------|
-| V8 (Initial CBOR) | 100k  | 460 µs        | 4.5 µs       |
-| V7 (Compaction)   | 100K  | 266 µs        | 12.2 µs      |
-| V6 (Zig 0.15.1)   | 100k  | 125 µs        | 12.1 µs      |
-| V5 (Arena)        | 100k  | 122 µs        | 29 µs        |
-| V4 (Flush)        | 100k  | 241 µs        | 188 µs       |
-| V3 (1KB Msg)      | 100k  | 178 µs        | 0.1 µs       |
-| V2 (WAL)          | 10k   | 115 µs        | 0.11 µs      |
-| V1 (Memory)       | 10k   | 58 µs         | 0.11 µs      |
+| Version              | Scale | Write Latency | Read Latency |
+|----------------------|-------|---------------|--------------|
+| V8 (Optimized)       | 100k  | 75 µs         | 3.35 µs      |
+| V8 (Initial CBOR)    | 100k  | 460 µs        | 4.5 µs       |
+| V7 (Compaction)      | 100K  | 266 µs        | 12.2 µs      |
+| V6 (Zig 0.15.1)      | 100k  | 125 µs        | 12.1 µs      |
+| V5 (Arena)           | 100k  | 122 µs        | 29 µs        |
+| V4 (Flush)           | 100k  | 241 µs        | 188 µs       |
+| V3 (1KB Msg)         | 100k  | 178 µs        | 0.1 µs       |
+| V2 (WAL)             | 10k   | 115 µs        | 0.11 µs      |
+| V1 (Memory)          | 10k   | 58 µs         | 0.11 µs      |
 
 ## Overview
 The `writeManyLogs` test in `memtable.zig` evaluates the performance of the Zig Log Store's write and read operations for a single-node LSM-Tree implementation. The test measures the time to write and read large numbers of log entries, with and without persistence and flushing, to assess the efficiency of memory management and storage mechanisms. V1 and V2 provide valuable baselines for single-threaded performance, representing the minimum achievable times for in-memory and WAL-persisted operations, respectively.
@@ -33,6 +34,7 @@ The `writeManyLogs` test in `memtable.zig` evaluates the performance of the Zig 
   - **V6**: V5 with upgrade to Zig 0.15.1.
   - **V7**: V6 + SSTable compaction (merge on threshold).
   - **V8(Initial)**: V7 + CBOR persistence (replacing JSON).
+  - **V8(Optimized)**: V8(Initial) + optimized CBOR encoding/decoding.
 - **Hardware Assumptions**: Standard development machine (e.g., 4-core CPU, SSD, 16GB RAM), Zig 0.15.1 for V6-V7, Zig 0.14.1 for V1–V5.
 - **Test Flow**:
   - Write `N` entries using `MemTable.writeLog`, appending to WAL (V2–V7) and inserting into sorted memtable.
@@ -41,6 +43,31 @@ The `writeManyLogs` test in `memtable.zig` evaluates the performance of the Zig 
   - Measure total time, compute per-entry latency (µs), and calculate write:read ratio.
 
 ## Results
+
+### V8 (Optimized)
+| Scale | Write Time | Write Latency | Read Time | Read Latency | Write:Read Ratio |
+|-------|------------|---------------|-----------|--------------|------------------|
+| 100k  | 7.48 s     | 74.76 µs      | 0.34 s    | 3.35 µs      | 22.30            |
+
+**Detailed Metrics**:
+- **MemTable**:
+  - Flush time: 23,068 µs per flush
+  - Flush count: 100
+- **WAL**:
+  - CBOR encode time: 3 µs per entry
+  - Write time: 20 µs per entry
+- **LogEntry**:
+  - Push time: 2 µs per entry (300,100 operations)
+  - Finish time: 0 µs per entry (300,100 operations)
+
+- **Observations**:
+  - Write latency: ~75 µs → ~6.1x faster than V8 Initial (~460 µs), ~3.5x slower than V7 (~266 µs).
+    - CBOR encoding optimized to just 3 µs per entry.
+    - WAL write overhead is 20 µs per entry, dominating the write path.
+  - Read latency: ~3.35 µs → ~1.3x faster than V8 Initial (~4.5 µs), ~3.6x faster than V7 (~12.2 µs).
+    - Binary CBOR deserialization continues to outperform JSON.
+  - Write:Read ratio: ~22.3 → Within the 10:1–100:1 target range.
+  - **Key improvement**: Optimizations reduced write latency by 84% compared to V8 Initial.
 
 ### V8 (Initial CBOR persistency)
 | Scale | Write Time | Write Latency | Read Time | Read Latency | Write:Read Ratio |
@@ -141,21 +168,23 @@ The `writeManyLogs` test in `memtable.zig` evaluates the performance of the Zig 
 
 ## Analysis
 - **General Progression**:
-  - **Writes**: V1 (~58 µs) → V2 (~115 µs) → V3 (~138–178 µs) → V4 (~241–250 µs) → V5 (~114–122 µs) → V6 (~122–129 µs) → V7 (~266 µs) → V8 (~460 µs). V8 regression likely due to initial unoptimized CBOR implementation.
-  - **Reads**: V1–V3 (~0.11–0.12 µs) → V4 (~148–188 µs) → V5 (~29–30 µs) → V6 (~12.0–12.4 µs) → V7 (~12.2 µs) → V8 (~4.5 µs). CBOR provides a massive speedup.
+  - **Writes**: V1 (~58 µs) → V2 (~115 µs) → V3 (~138–178 µs) → V4 (~241–250 µs) → V5 (~114–122 µs) → V6 (~122–129 µs) → V7 (~266 µs) → V8 Initial (~460 µs) → V8 Optimized (~75 µs). V8 Initial regression resolved through optimization.
+  - **Reads**: V1–V3 (~0.11–0.12 µs) → V4 (~148–188 µs) → V5 (~29–30 µs) → V6 (~12.0–12.4 µs) → V7 (~12.2 µs) → V8 Initial (~4.5 µs) → V8 Optimized (~3.35 µs). CBOR provides significant speedup.
   - **Weakness**: Foreground compaction blocks writes; consider background threads (Week 7).
 
 - **Write Performance**:
-  - **Progression**: V1 (~58 µs, in-memory baseline) → V2 (~115 µs, WAL) → V3 (~138–178 µs, 1KB messages) → V4 (~241–250 µs, flush) → V5 (~114–122 µs, arena) → V6 (~122–129 µs) → V7 (~266 µs) → V8 (~460 µs).
-  - **Weakness**: JSON serialization (`LogEntry.ser`) and WAL `fsync` remain costly, though arena mitigates this. Compaction adds sort/write overhead.
+  - **Progression**: V1 (~58 µs, in-memory baseline) → V2 (~115 µs, WAL) → V3 (~138–178 µs, 1KB messages) → V4 (~241–250 µs, flush) → V5 (~114–122 µs, arena) → V6 (~122–129 µs) → V7 (~266 µs) → V8 Initial (~460 µs) → V8 Optimized (~75 µs).
+  - **V8 Optimized breakdown**: CBOR encoding (3 µs) + WAL write (20 µs) + LogEntry operations (2 µs) + flush overhead (~23 ms per 1,000 entries).
+  - **Weakness**: WAL `fsync` overhead (20 µs per entry) remains the dominant cost. Compaction adds sort/write overhead.
 
 - **Read Performance**:
-  - **Progression**: V1–V3 (~0.11–0.12 µs, in-memory baseline) → V4 (~148–188 µs, ~100 SSTables) → V5 (~29–30 µs) → V6 (~12.0–12.4 µs) → V7 (~12.2 µs) → V8 (~4.5 µs).
-  - **Baseline**: V1’s ~0.11 µs/read is the single-threaded minimum, unachievable with persistence.
-  - **Weakness**: Sequential SSTable access remains a bottleneck (1.2–1.24 s for 100k), requiring sparse indexing.
+  - **Progression**: V1–V3 (~0.11–0.12 µs, in-memory baseline) → V4 (~148–188 µs, ~100 SSTables) → V5 (~29–30 µs) → V6 (~12.0–12.4 µs) → V7 (~12.2 µs) → V8 Initial (~4.5 µs) → V8 Optimized (~3.35 µs).
+  - **Baseline**: V1's ~0.11 µs/read is the single-threaded minimum, unachievable with persistence.
+  - **V8 Optimized**: Total read time of 0.34 s for 100k entries shows excellent performance with CBOR deserialization.
+  - **Weakness**: Sequential SSTable access remains a bottleneck, requiring sparse indexing.
 
 - **Write:Read Ratio**:
-  - V1 (~500:1) → V2 (~1,000:1) → V3 (~1,300–1,600:1) → V4 (~1.28–1.70:1) → V5 (~3.83–4.26:1) → V6 (~10.23–10.47) → V7 (~21.72) → V8 (~103). V8 hits the upper end of the target.
+  - V1 (~500:1) → V2 (~1,000:1) → V3 (~1,300–1,600:1) → V4 (~1.28–1.70:1) → V5 (~3.83–4.26:1) → V6 (~10.23–10.47) → V7 (~21.72) → V8 Initial (~103) → V8 Optimized (~22.3). V8 Optimized maintains excellent balance within target range.
 
 - **V7 Optimizations**:
   - Tiered compaction reduces file count (~25 vs ~100). Write slowdown (~110%) due to foreground merges; consider background compaction. Read stable, ready for indexing.
@@ -178,6 +207,6 @@ The `writeManyLogs` test in `memtable.zig` evaluates the performance of the Zig 
   - Test specific timestamp ranges (e.g., last 1,000 entries) to assess read performance for typical queries.
 
 ## Conclusion
-The `writeManyLogs` test continues to evolve, with V8 introducing CBOR persistence. V8 achieves ~460 µs/write and ~4.5 µs/read at 100k entries. While writes are slower than V7 (~266 µs), likely due to initial implementation overhead, reads are significantly faster (~2.7x improvement over V7), proving the benefit of binary serialization. The write:read ratio has jumped to ~103, hitting the upper end of our target. Optimization of the write path is the next priority.
+The `writeManyLogs` test continues to evolve, with V8 introducing and optimizing CBOR persistence. V8 (Optimized) achieves ~75 µs/write and ~3.35 µs/read at 100k entries. Compared to V8 Initial (~460 µs/write), the optimized version is 6.1x faster on writes through improved CBOR encoding (3 µs per entry). Reads improved by 1.3x (~3.35 µs vs ~4.5 µs). The write:read ratio of ~22.3 sits comfortably within the 10:1–100:1 target range. The main bottleneck is now WAL write overhead (20 µs per entry), suggesting batched WAL writes as the next optimization opportunity.
 
-**Tested on**: November 24, 2025
+**Tested on**: December 6, 2025
